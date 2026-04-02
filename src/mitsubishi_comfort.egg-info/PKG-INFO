@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: mitsubishi-comfort
+Version: 0.1.0
+Summary: Async Python library for Mitsubishi minisplit control via Kumo Cloud and local API
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: aiohttp>=3.9.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
+Requires-Dist: aioresponses>=0.7; extra == "dev"
