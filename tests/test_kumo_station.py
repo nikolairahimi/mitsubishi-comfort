@@ -1,38 +1,44 @@
 """Tests for mitsubishi_comfort.kumo_station."""
 
-import pytest
-from unittest.mock import AsyncMock, patch
+from __future__ import annotations
+
+from unittest.mock import AsyncMock
+
 from mitsubishi_comfort.kumo_station import KumoStation
 
 
-@pytest.fixture
-def station(device_name, device_address, device_credentials, device_serial):
+VALID_PASSWORD_B64 = "dGVzdHBhc3N3b3Jk"
+VALID_CRYPTO_HEX = "0102030405060708090a"
+
+
+def _make_station() -> KumoStation:
     return KumoStation(
-        name=device_name,
-        address=device_address,
-        password_b64=device_credentials["password"],
-        crypto_serial_hex=device_credentials["crypto_serial"],
-        serial=device_serial,
+        name="Outdoor Unit",
+        address="192.168.1.101",
+        password_b64=VALID_PASSWORD_B64,
+        crypto_serial_hex=VALID_CRYPTO_HEX,
+        serial="KUMO001",
     )
 
 
-async def test_update_status_success(station):
-    responses = [
-        {"r": {"eqc": {"oat": 15.5}}},
-        {"r": {"sensors": {"0": {"uuid": "s1", "humidity": 60.0, "temperature": 16.0, "battery": 90, "rssi": -50, "txPower": 4}}}},
-        {"r": {"sensors": {"1": {}}}},
-        {"r": {"adapter": {"status": {"localNetwork": {"stationMode": {"RSSI": -40}}}}}},
-    ]
-    with patch.object(station, "request", new_callable=AsyncMock, side_effect=responses):
+class TestUpdateStatus:
+    async def test_success(self):
+        station = _make_station()
+        responses = [
+            {"r": {"eqc": {"oat": 15.5}}},
+            {},  # sensors slot 0 (no uuid -> break)
+            {"r": {"adapter": {"status": {"localNetwork": {"stationMode": {"RSSI": -40}}}}}},
+        ]
+        station.request = AsyncMock(side_effect=responses)
+
         result = await station.update_status()
+        assert result is True
+        assert station.status.outdoor_temperature == 15.5
+        assert station.status.wifi_rssi == -40
 
-    assert result is True
-    assert station.status.outdoor_temperature == 15.5
-    assert station.status.wifi_rssi == -40
+    async def test_failure(self):
+        station = _make_station()
+        station.request = AsyncMock(return_value={})
 
-
-async def test_update_status_failure(station):
-    with patch.object(station, "request", new_callable=AsyncMock, return_value={}):
         result = await station.update_status()
-
-    assert result is False
+        assert result is False

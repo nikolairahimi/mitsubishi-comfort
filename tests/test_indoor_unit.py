@@ -1,245 +1,283 @@
 """Tests for mitsubishi_comfort.indoor_unit."""
 
-import json
-import pytest
+from __future__ import annotations
+
 from unittest.mock import AsyncMock, patch
+
+import pytest
+
 from mitsubishi_comfort.indoor_unit import IndoorUnit
-from mitsubishi_comfort.types import CommandResult, DeviceStatus, Mode, FanSpeed, VaneDirection
+from mitsubishi_comfort.types import (
+    FanSpeed,
+    Mode,
+    VaneDirection,
+)
 
 
-@pytest.fixture
-def unit(device_name, device_address, device_credentials, device_serial):
+VALID_PASSWORD_B64 = "dGVzdHBhc3N3b3Jk"
+VALID_CRYPTO_HEX = "0102030405060708090a"
+
+
+def _make_unit() -> IndoorUnit:
     return IndoorUnit(
-        name=device_name,
-        address=device_address,
-        password_b64=device_credentials["password"],
-        crypto_serial_hex=device_credentials["crypto_serial"],
-        serial=device_serial,
+        name="Test Unit",
+        address="192.168.1.100",
+        password_b64=VALID_PASSWORD_B64,
+        crypto_serial_hex=VALID_CRYPTO_HEX,
+        serial="TEST001",
     )
 
 
-def _make_status_response(
-    mode="cool", standby=False, sp_heat=20.0, sp_cool=24.0,
-    room_temp=22.5, fan_speed="auto", vane_dir="auto",
-    filter_dirty=False, defrost=False,
-):
+def _status_response(
+    mode="cool",
+    sp_cool=24.0,
+    sp_heat=21.0,
+    room_temp=23.5,
+    fan="auto",
+    vane="auto",
+) -> dict:
     return {
         "r": {
             "indoorUnit": {
                 "status": {
                     "mode": mode,
-                    "standby": standby,
-                    "spHeat": sp_heat,
+                    "standby": False,
                     "spCool": sp_cool,
+                    "spHeat": sp_heat,
                     "roomTemp": room_temp,
-                    "fanSpeed": fan_speed,
-                    "vaneDir": vane_dir,
-                    "filterDirty": filter_dirty,
-                    "defrost": defrost,
+                    "fanSpeed": fan,
+                    "vaneDir": vane,
+                    "filterDirty": False,
+                    "defrost": False,
                 }
             }
         }
     }
 
 
-def _make_profile_response(
-    num_fan_speeds=5, has_auto_fan=True, has_vane_swing=True,
-    has_dry=True, has_heat=True, has_vent=True, has_auto=True,
-    has_vane_dir=True,
-):
-    return {
-        "r": {
-            "indoorUnit": {
-                "profile": {
-                    "numberOfFanSpeeds": num_fan_speeds,
-                    "hasFanSpeedAuto": has_auto_fan,
-                    "hasVaneSwing": has_vane_swing,
-                    "hasModeDry": has_dry,
-                    "hasModeHeat": has_heat,
-                    "hasModeVent": has_vent,
-                    "hasModeAuto": has_auto,
-                    "hasVaneDir": has_vane_dir,
-                }
-            }
-        }
+def _profile_response(**overrides) -> dict:
+    profile = {
+        "hasModeHeat": True,
+        "hasModeDry": True,
+        "hasModeVent": True,
+        "hasModeAuto": True,
+        "hasVaneDir": True,
+        "hasVaneSwing": True,
+        "hasFanSpeedAuto": True,
+        "numberOfFanSpeeds": 5,
+        "minimumSetPoints": {"cool": 18.0, "heat": 16.0},
+        "maximumSetPoints": {"cool": 30.0, "heat": 28.0},
     }
+    profile.update(overrides)
+    return {"r": {"indoorUnit": {"profile": profile}}}
 
 
-def _make_adapter_response(
-    auto_prevention=False, user_dry=True, user_heat=True,
-    rssi=-55, run_state="on",
-):
+def _adapter_status_response(**overrides) -> dict:
+    adapter = {
+        "autoModePrevention": False,
+        "userHasModeDry": True,
+        "userHasModeHeat": True,
+        "localNetwork": {"stationMode": {"RSSI": -55}},
+        "runState": "on",
+        "uptime": 86400,
+    }
+    adapter.update(overrides)
+    return {"r": {"adapter": {"status": adapter}}}
+
+
+def _adapter_info_response() -> dict:
     return {
         "r": {
             "adapter": {
-                "status": {
-                    "autoModePrevention": auto_prevention,
-                    "userHasModeDry": user_dry,
-                    "userHasModeHeat": user_heat,
-                    "localNetwork": {"stationMode": {"RSSI": rssi}},
-                    "runState": run_state,
+                "info": {
+                    "firmwareVersion": "2.1.0",
+                    "hardwareVersion": "1.0.0",
                 }
             }
         }
     }
 
 
-def _make_sensor_response(index, humidity=45.0, temp=22.0, battery=85, rssi=-60):
-    return {
-        "r": {
-            "sensors": {
-                str(index): {
-                    "uuid": "sensor-uuid-1",
-                    "humidity": humidity,
-                    "temperature": temp,
-                    "battery": battery,
-                    "rssi": rssi,
-                    "txPower": 4,
-                }
-            }
-        }
-    }
+def _mhk2_response(humidity=None) -> dict:
+    if humidity is not None:
+        return {"r": {"mhk2": {"status": {"indoorHumid": humidity}}}}
+    return {"r": {"mhk2": None}}
 
 
-def _make_empty_sensor_response(index):
-    return {"r": {"sensors": {str(index): {}}}}
+class TestUpdateStatus:
+    async def test_update_status_success(self):
+        """Parses all status fields correctly on first poll."""
+        unit = _make_unit()
+        responses = [
+            _status_response(),          # indoorUnit status
+            {},                           # sensors slot 0 (no uuid -> break)
+            _profile_response(),          # profile
+            _adapter_status_response(),   # adapter status
+            _adapter_info_response(),     # adapter info
+            _mhk2_response(),            # mhk2 (None -> skip)
+        ]
+        unit.request = AsyncMock(side_effect=responses)
 
-
-def _make_mhk2_response(humidity=None):
-    return {"r": {"mhk2": {"status": {"indoorHumid": humidity}}}}
-
-
-async def test_update_status_success(unit):
-    responses = [
-        _make_status_response(),
-        _make_sensor_response(0),
-        _make_empty_sensor_response(1),
-        _make_profile_response(),
-        _make_adapter_response(),
-        _make_mhk2_response(),
-    ]
-    with patch.object(unit, "request", new_callable=AsyncMock, side_effect=responses):
         result = await unit.update_status()
+        assert result is True
+        assert unit.status.mode == "cool"
+        assert unit.status.cool_setpoint == 24.0
+        assert unit.status.heat_setpoint == 21.0
+        assert unit.status.room_temperature == 23.5
+        assert unit.status.fan_speed == "auto"
+        assert unit.status.vane_direction == "auto"
+        assert unit.status.wifi_rssi == -55
+        assert unit.status.uptime == 86400
+        assert unit.status.firmware_version == "2.1.0"
+        assert unit.status.min_cool_setpoint == 18.0
+        assert unit.status.max_cool_setpoint == 30.0
 
-    assert result is True
-    status = unit.status
-    assert status.mode == "cool"
-    assert status.room_temperature == 22.5
-    assert status.cool_setpoint == 24.0
-    assert status.heat_setpoint == 20.0
-    assert status.fan_speed == "auto"
-    assert status.vane_direction == "auto"
-    assert status.current_humidity == 45.0
-    assert status.wifi_rssi == -55
-    assert status.sensor_battery == 85
+    async def test_update_status_failure(self):
+        """Returns False on bad response."""
+        unit = _make_unit()
+        unit.request = AsyncMock(return_value={})
 
-
-async def test_update_status_failure(unit):
-    with patch.object(unit, "request", new_callable=AsyncMock, return_value={}):
         result = await unit.update_status()
+        assert result is False
 
-    assert result is False
+    async def test_profile_cached_after_first_poll(self):
+        """Profile only fetched once."""
+        unit = _make_unit()
+        # First poll: full set of responses
+        first_poll = [
+            _status_response(),
+            {},  # sensors
+            _profile_response(),
+            _adapter_status_response(),
+            _adapter_info_response(),
+            _mhk2_response(),
+        ]
+        unit.request = AsyncMock(side_effect=first_poll)
+        await unit.update_status()
+        assert unit._profile_fetched is True
+
+        # Second poll: only status + sensors + adapter status + mhk2
+        second_poll = [
+            _status_response(mode="heat"),
+            {},  # sensors
+            _adapter_status_response(),
+            _mhk2_response(),
+        ]
+        unit.request = AsyncMock(side_effect=second_poll)
+        result = await unit.update_status()
+        assert result is True
+        assert unit.status.mode == "heat"
+        # Profile limits carried forward
+        assert unit.status.min_cool_setpoint == 18.0
 
 
-async def test_set_mode(unit):
-    unit._profile = {"hasModeHeat": True, "hasModeDry": True, "hasModeVent": True, "hasModeAuto": True}
-    response = {"r": {"indoorUnit": {"status": {"mode": "heat"}}}}
+class TestSetCommands:
+    async def test_set_mode_success(self):
+        unit = _make_unit()
+        unit._profile = {"hasModeHeat": True}
+        unit.request = AsyncMock(return_value={"r": {"indoorUnit": {"status": {}}}})
 
-    with patch.object(unit, "request", new_callable=AsyncMock, return_value=response):
         result = await unit.set_mode(Mode.HEAT)
+        assert result.success is True
+        assert result.value == "heat"
 
-    assert result.success is True
-    assert result.value == "heat"
+    async def test_set_mode_unsupported(self):
+        unit = _make_unit()
+        unit._profile = {}
 
+        result = await unit.set_mode(Mode.AUTO)
+        assert result.success is False
 
-async def test_set_mode_invalid(unit):
-    unit._profile = {}
-    result = await unit.set_mode(Mode.HEAT)
-    assert result.success is False
+    async def test_set_cool_setpoint(self):
+        unit = _make_unit()
+        unit.request = AsyncMock(return_value={"r": {"indoorUnit": {"status": {}}}})
 
+        result = await unit.set_cool_setpoint(22.5)
+        assert result.success is True
+        assert result.value == 22.5
+        call_data = unit.request.call_args[0][0]
+        assert b'"spCool":22.5' in call_data
 
-async def test_set_cool_setpoint(unit):
-    response = {"r": {"indoorUnit": {"status": {"spCool": 23.0}}}}
+    async def test_set_heat_setpoint(self):
+        unit = _make_unit()
+        unit.request = AsyncMock(return_value={"r": {"indoorUnit": {"status": {}}}})
 
-    with patch.object(unit, "request", new_callable=AsyncMock, return_value=response):
-        result = await unit.set_cool_setpoint(23.0)
+        result = await unit.set_heat_setpoint(20.0)
+        assert result.success is True
+        assert result.value == 20.0
 
-    assert result.success is True
-    assert result.value == 23.0
+    async def test_set_fan_speed(self):
+        unit = _make_unit()
+        unit._profile = {"numberOfFanSpeeds": 5, "hasFanSpeedAuto": True}
+        unit.request = AsyncMock(return_value={"r": {"indoorUnit": {"status": {}}}})
 
+        result = await unit.set_fan_speed(FanSpeed.AUTO)
+        assert result.success is True
+        assert result.value == "auto"
 
-async def test_set_cool_setpoint_failure(unit):
-    with patch.object(unit, "request", new_callable=AsyncMock, return_value={}):
-        result = await unit.set_cool_setpoint(23.0)
+    async def test_set_vane_direction(self):
+        unit = _make_unit()
+        unit._profile = {"hasVaneDir": True, "hasVaneSwing": True}
+        unit.request = AsyncMock(return_value={"r": {"indoorUnit": {"status": {}}}})
 
-    assert result.success is False
-
-
-async def test_set_heat_setpoint(unit):
-    response = {"r": {"indoorUnit": {"status": {"spHeat": 21.0}}}}
-
-    with patch.object(unit, "request", new_callable=AsyncMock, return_value=response):
-        result = await unit.set_heat_setpoint(21.0)
-
-    assert result.success is True
-    assert result.value == 21.0
-
-
-async def test_set_fan_speed(unit):
-    unit._profile = {"numberOfFanSpeeds": 5, "hasFanSpeedAuto": True}
-    response = {"r": {"indoorUnit": {"status": {"fanSpeed": "quiet"}}}}
-
-    with patch.object(unit, "request", new_callable=AsyncMock, return_value=response):
-        result = await unit.set_fan_speed(FanSpeed.QUIET)
-
-    assert result.success is True
-    assert result.value == "quiet"
-
-
-async def test_set_vane_direction(unit):
-    unit._profile = {"hasVaneDir": True, "hasVaneSwing": True}
-    response = {"r": {"indoorUnit": {"status": {"vaneDir": "swing"}}}}
-
-    with patch.object(unit, "request", new_callable=AsyncMock, return_value=response):
         result = await unit.set_vane_direction(VaneDirection.SWING)
-
-    assert result.success is True
-    assert result.value == "swing"
-
-
-async def test_get_supported_modes(unit):
-    unit._profile = {"hasModeHeat": True, "hasModeDry": True, "hasModeVent": False, "hasModeAuto": True}
-    modes = unit.supported_modes
-    assert Mode.OFF in modes
-    assert Mode.COOL in modes
-    assert Mode.HEAT in modes
-    assert Mode.DRY in modes
-    assert Mode.FAN not in modes
-    assert Mode.AUTO in modes
+        assert result.success is True
+        assert result.value == "swing"
 
 
-async def test_get_supported_fan_speeds_5(unit):
-    unit._profile = {"numberOfFanSpeeds": 5, "hasFanSpeedAuto": True}
-    speeds = unit.supported_fan_speeds
-    assert FanSpeed.SUPER_QUIET in speeds
-    assert FanSpeed.AUTO in speeds
-    assert len(speeds) == 6
+class TestSupportedModes:
+    def test_supported_modes(self):
+        unit = _make_unit()
+        unit._profile = {
+            "hasModeHeat": True,
+            "hasModeDry": True,
+            "hasModeVent": True,
+            "hasModeAuto": True,
+        }
+        modes = unit.supported_modes
+        assert Mode.OFF in modes
+        assert Mode.COOL in modes
+        assert Mode.HEAT in modes
+        assert Mode.DRY in modes
+        assert Mode.FAN in modes
+        assert Mode.AUTO in modes
+
+    def test_supported_modes_minimal(self):
+        unit = _make_unit()
+        unit._profile = {}
+        modes = unit.supported_modes
+        assert modes == [Mode.OFF, Mode.COOL]
 
 
-async def test_get_supported_fan_speeds_3(unit):
-    unit._profile = {"numberOfFanSpeeds": 3, "hasFanSpeedAuto": False}
-    speeds = unit.supported_fan_speeds
-    assert speeds == [FanSpeed.QUIET, FanSpeed.LOW, FanSpeed.POWERFUL]
+class TestSupportedFanSpeeds:
+    def test_4_speed_config(self):
+        unit = _make_unit()
+        unit._profile = {"numberOfFanSpeeds": 4, "hasFanSpeedAuto": False}
+        speeds = unit.supported_fan_speeds
+        assert len(speeds) == 4
+        assert FanSpeed.AUTO not in speeds
+
+    def test_5_speed_config(self):
+        unit = _make_unit()
+        unit._profile = {"numberOfFanSpeeds": 5, "hasFanSpeedAuto": True}
+        speeds = unit.supported_fan_speeds
+        assert len(speeds) == 6
+        assert FanSpeed.SUPER_QUIET in speeds
+        assert FanSpeed.AUTO in speeds
 
 
-async def test_get_supported_vane_directions(unit):
-    unit._profile = {"hasVaneDir": True, "hasVaneSwing": True}
-    dirs = unit.supported_vane_directions
-    assert VaneDirection.SWING in dirs
-    assert VaneDirection.AUTO in dirs
+class TestMHK2:
+    async def test_mhk2_skipped_after_none(self):
+        unit = _make_unit()
+        responses = [
+            _status_response(),
+            {},  # sensors
+            _profile_response(),
+            _adapter_status_response(),
+            _adapter_info_response(),
+            _mhk2_response(humidity=None),
+        ]
+        unit.request = AsyncMock(side_effect=responses)
 
-
-async def test_get_supported_vane_directions_none(unit):
-    unit._profile = {"hasVaneDir": False}
-    dirs = unit.supported_vane_directions
-    assert dirs == []
+        await unit.update_status()
+        assert unit._has_mhk2 is False

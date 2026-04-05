@@ -79,3 +79,11 @@ class DeviceStatus:
     sensor_battery: int | None = None
     sensor_rssi: int | None = None
     run_state: str | None = None
+    vane_left_right: str | None = None
+    uptime: int | None = None
+    firmware_version: str | None = None
+    hardware_version: str | None = None
+    min_cool_setpoint: float | None = None
+    max_cool_setpoint: float | None = None
+    min_heat_setpoint: float | None = None
+    max_heat_setpoint: float | None = None

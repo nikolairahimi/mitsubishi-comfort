@@ -9,8 +9,12 @@ class AuthenticationError(MitsubishiComfortError):
     """Cloud authentication failed (bad credentials or expired token)."""
 
 
-class ConnectionError(MitsubishiComfortError):
+class DeviceConnectionError(MitsubishiComfortError):
     """Could not reach the device or cloud API."""
+
+
+# Backward compatibility
+ConnectionError = DeviceConnectionError
 
 
 class DeviceUnavailableError(MitsubishiComfortError):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -45,6 +46,18 @@ class MitsubishiCloudAccount:
         self._password = password
         self._access_token: str | None = None
         self._refresh_token: str | None = None
+        self._session: aiohttp.ClientSession | None = None
+        self._user_id: str | None = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=self._timeout())
+        return self._session
+
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     def _timeout(self) -> aiohttp.ClientTimeout:
         return aiohttp.ClientTimeout(
@@ -65,14 +78,14 @@ class MitsubishiCloudAccount:
             "appVersion": V3_APP_VERSION,
         }
         try:
-            async with aiohttp.ClientSession(timeout=self._timeout()) as session:
-                async with session.post(
-                    f"{V3_BASE_URL}/v3/login", headers=_BASE_HEADERS, json=body
-                ) as resp:
-                    if not resp.ok:
-                        _LOGGER.warning("V3 login failed: HTTP %s", resp.status)
-                        return False
-                    data = await resp.json()
+            session = await self._get_session()
+            async with session.post(
+                f"{V3_BASE_URL}/v3/login", headers=_BASE_HEADERS, json=body
+            ) as resp:
+                if not resp.ok:
+                    _LOGGER.warning("V3 login failed: HTTP %s", resp.status)
+                    return False
+                data = await resp.json()
         except Exception as ex:
             _LOGGER.warning("V3 login error: %s", ex)
             return False
@@ -89,15 +102,15 @@ class MitsubishiCloudAccount:
 
         headers = {**_BASE_HEADERS, "Authorization": f"Bearer {self._refresh_token}"}
         try:
-            async with aiohttp.ClientSession(timeout=self._timeout()) as session:
-                async with session.post(
-                    f"{V3_BASE_URL}/v3/refresh",
-                    headers=headers,
-                    json={"refresh": self._refresh_token},
-                ) as resp:
-                    if not resp.ok:
-                        return False
-                    data = await resp.json()
+            session = await self._get_session()
+            async with session.post(
+                f"{V3_BASE_URL}/v3/refresh",
+                headers=headers,
+                json={"refresh": self._refresh_token},
+            ) as resp:
+                if not resp.ok:
+                    return False
+                data = await resp.json()
         except Exception:
             return False
 
@@ -111,16 +124,16 @@ class MitsubishiCloudAccount:
         """Authenticated GET with automatic token refresh on 401."""
         url = f"{V3_BASE_URL}{path}"
         try:
-            async with aiohttp.ClientSession(timeout=self._timeout()) as session:
-                async with session.get(url, headers=self._auth_headers()) as resp:
-                    if resp.status == 401 and await self.refresh():
-                        async with session.get(url, headers=self._auth_headers()) as retry_resp:
-                            if not retry_resp.ok:
-                                return None
-                            return await retry_resp.json()
-                    if not resp.ok:
-                        return None
-                    return await resp.json()
+            session = await self._get_session()
+            async with session.get(url, headers=self._auth_headers()) as resp:
+                if resp.status == 401 and await self.refresh():
+                    async with session.get(url, headers=self._auth_headers()) as retry_resp:
+                        if not retry_resp.ok:
+                            return None
+                        return await retry_resp.json()
+                if not resp.ok:
+                    return None
+                return await resp.json()
         except Exception as ex:
             _LOGGER.warning("V3 GET %s error: %s", path, ex)
             return None
@@ -152,8 +165,8 @@ class MitsubishiCloudAccount:
         passwords: dict[str, str] = {}
 
         try:
-            async with aiohttp.ClientSession() as session:
-                await self._socketio_poll(session, serials_needed, timeout_secs, passwords)
+            session = await self._get_session()
+            await self._socketio_poll(session, serials_needed, timeout_secs, passwords)
         except Exception as ex:
             _LOGGER.warning("WebSocket password retrieval error: %s", ex)
 
@@ -264,6 +277,8 @@ class MitsubishiCloudAccount:
                       len(passwords), len(serials_needed))
 
     def _get_user_id_from_token(self) -> str | None:
+        if self._user_id is not None:
+            return self._user_id
         if not self._access_token:
             return None
         try:
@@ -271,7 +286,8 @@ class MitsubishiCloudAccount:
             payload_b64 += "=" * ((-len(payload_b64)) % 4)
             payload = json.loads(base64.urlsafe_b64decode(payload_b64))
             user_id = payload.get("id")
-            return str(user_id) if user_id is not None else None
+            self._user_id = str(user_id) if user_id is not None else None
+            return self._user_id
         except Exception:
             return None
 
@@ -302,13 +318,21 @@ class MitsubishiCloudAccount:
 
     # ── High-Level Discovery ───────────────────────────
 
-    async def discover_devices(self) -> dict[str, DeviceInfo]:
+    async def discover_devices(
+        self, cached_credentials: dict[str, dict] | None = None,
+    ) -> dict[str, DeviceInfo]:
         """Discover all devices on this account.
+
+        Args:
+            cached_credentials: Optional dict of serial -> {password, crypto_serial, ...}.
+                Devices with cached credentials skip the Socket.IO password retrieval.
 
         Returns dict mapping serial -> DeviceInfo.
         """
         if not self._access_token and not await self.login():
             raise AuthenticationError("V3 login failed")
+
+        cached = cached_credentials or {}
 
         devices: dict[str, dict] = {}
         for site in await self.get_sites():
@@ -323,33 +347,45 @@ class MitsubishiCloudAccount:
                         "label": zone.get("name", ""),
                         "unit_type": adapter.get("unitType", "ductless"),
                         "mac": adapter.get("macAddress", ""),
-                        "password": "",
-                        "crypto_serial": "",
+                        "password": cached.get(serial, {}).get("password", ""),
+                        "crypto_serial": cached.get(serial, {}).get("crypto_serial", ""),
                     }
 
         if not devices:
             _LOGGER.warning("No devices found via V3 API")
             return {}
 
-        # Get cryptoSerials
-        for serial in devices:
-            status = await self.get_device_status(serial)
-            if isinstance(status, dict):
-                crypto = status.get("cryptoSerial", "")
-                if crypto:
-                    devices[serial]["crypto_serial"] = crypto
+        # Get cryptoSerials for devices that don't have one cached
+        missing_crypto = [(s, d) for s, d in devices.items() if not d["crypto_serial"]]
+        if missing_crypto:
+            results = await asyncio.gather(
+                *[self.get_device_status(s) for s, _ in missing_crypto]
+            )
+            for (serial, dev), status in zip(missing_crypto, results):
+                if isinstance(status, dict):
+                    crypto = status.get("cryptoSerial", "")
+                    if crypto:
+                        dev["crypto_serial"] = crypto
 
-        # Get passwords via Socket.IO
-        passwords = await self.get_passwords_via_websocket(list(devices.keys()), timeout_secs=60)
-        for serial, password in passwords.items():
-            if serial in devices:
-                devices[serial]["password"] = password
+        # Only fetch passwords via Socket.IO for devices missing them
+        need_passwords = [s for s, d in devices.items() if not d["password"]]
+        if need_passwords:
+            _LOGGER.info(
+                "Fetching passwords via Socket.IO for %d/%d devices",
+                len(need_passwords), len(devices),
+            )
+            passwords = await self.get_passwords_via_websocket(need_passwords, timeout_secs=60)
+            for serial, password in passwords.items():
+                if serial in devices:
+                    devices[serial]["password"] = password
+        else:
+            _LOGGER.info("All %d devices have cached credentials, skipping Socket.IO", len(devices))
 
         return {
             serial: DeviceInfo(
                 serial=serial,
                 label=dev["label"],
-                address="",
+                address=cached.get(serial, {}).get("address", ""),
                 mac=dev["mac"],
                 unit_type=dev["unit_type"],
                 password=dev["password"],

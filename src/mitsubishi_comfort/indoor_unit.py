@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 
-from .const import MAX_SENSORS
 from .device import Device
 from .types import CommandResult, DeviceStatus, FanSpeed, Mode, VaneDirection
 
@@ -33,7 +32,8 @@ class IndoorUnit(Device):
         super().__init__(**kwargs)
         self._status = DeviceStatus()
         self._profile: dict = {}
-        self._sensors: list[dict] = []
+        self._profile_fetched = False
+        self._has_mhk2: bool = True
 
     @property
     def status(self) -> DeviceStatus:
@@ -71,7 +71,7 @@ class IndoorUnit(Device):
 
     async def update_status(self) -> bool:
         """Poll the device for current status, profile, and sensors. Returns True on success."""
-        # Indoor unit status
+        # Indoor unit status (always fetch)
         query = b'{"c":{"indoorUnit":{"status":{}}}}'
         response = await self.request(query)
         try:
@@ -80,58 +80,121 @@ class IndoorUnit(Device):
             _LOGGER.warning("Device %s: failed to retrieve status", self._name)
             return False
 
-        # Sensors
-        sensors = []
-        for i in range(MAX_SENSORS):
-            query = f'{{"c":{{"sensors":{{"{i}":{{}}}}}}}}'.encode()
+        # Sensors (always fetch)
+        sensors = await self._fetch_sensors()
+
+        # Profile, adapter status, adapter info, MHK2 — only on first poll
+        min_cool_sp = None
+        max_cool_sp = None
+        min_heat_sp = None
+        max_heat_sp = None
+        firmware_version = None
+        hardware_version = None
+        uptime = None
+        wifi_rssi = None
+        run_state = None
+        mhk2_humidity = None
+
+        if not self._profile_fetched:
+            # Profile
+            query = b'{"c":{"indoorUnit":{"profile":{}}}}'
             response = await self.request(query)
             try:
-                sensor = response["r"]["sensors"][str(i)]
-                if isinstance(sensor, dict) and sensor.get("uuid"):
-                    sensors.append(sensor)
-                else:
-                    break
+                self._profile = response["r"]["indoorUnit"]["profile"]
             except (KeyError, TypeError):
-                break
+                _LOGGER.warning("Device %s: failed to retrieve profile", self._name)
+                return False
 
-        # Profile
-        query = b'{"c":{"indoorUnit":{"profile":{}}}}'
-        response = await self.request(query)
-        try:
-            self._profile = response["r"]["indoorUnit"]["profile"]
-        except (KeyError, TypeError):
-            _LOGGER.warning("Device %s: failed to retrieve profile", self._name)
-            return False
+            # Read setpoint limits from profile
+            min_sp = self._profile.get("minimumSetPoints", {})
+            max_sp = self._profile.get("maximumSetPoints", {})
+            min_cool_sp = min_sp.get("cool")
+            min_heat_sp = min_sp.get("heat")
+            max_cool_sp = max_sp.get("cool")
+            max_heat_sp = max_sp.get("heat")
 
-        # Adapter status
-        query = b'{"c":{"adapter":{"status":{}}}}'
-        response = await self.request(query)
-        try:
-            adapter = response["r"]["adapter"]["status"]
-            self._profile["hasModeAuto"] = not adapter.get("autoModePrevention", False)
-            if not adapter.get("userHasModeDry", False):
-                self._profile["hasModeDry"] = False
-            if not adapter.get("userHasModeHeat", False):
-                self._profile["hasModeHeat"] = False
+            # Adapter status
+            query = b'{"c":{"adapter":{"status":{}}}}'
+            response = await self.request(query)
             try:
-                wifi_rssi = adapter["localNetwork"]["stationMode"]["RSSI"]
-            except KeyError:
-                wifi_rssi = None
-            run_state = adapter.get("runState")
-        except (KeyError, TypeError):
-            _LOGGER.warning("Device %s: failed to retrieve adapter status", self._name)
-            return False
+                adapter = response["r"]["adapter"]["status"]
+                self._profile["hasModeAuto"] = not adapter.get("autoModePrevention", False)
+                if not adapter.get("userHasModeDry", False):
+                    self._profile["hasModeDry"] = False
+                if not adapter.get("userHasModeHeat", False):
+                    self._profile["hasModeHeat"] = False
+                try:
+                    wifi_rssi = adapter["localNetwork"]["stationMode"]["RSSI"]
+                except KeyError:
+                    wifi_rssi = None
+                run_state = adapter.get("runState")
+                uptime = adapter.get("uptime")
+            except (KeyError, TypeError):
+                _LOGGER.warning("Device %s: failed to retrieve adapter status", self._name)
+                return False
 
-        # MHK2 humidity (optional)
-        mhk2_humidity = None
-        query = b'{"c":{"mhk2":{"status":{}}}}'
-        response = await self.request(query)
-        try:
-            mhk2 = response.get("r", {}).get("mhk2")
-            if isinstance(mhk2, dict):
-                mhk2_humidity = mhk2.get("status", {}).get("indoorHumid")
-        except (KeyError, TypeError):
-            pass
+            # Adapter info (firmware/hardware versions)
+            query = b'{"c":{"adapter":{"info":{}}}}'
+            response = await self.request(query)
+            try:
+                adapter_info = response["r"]["adapter"]["info"]
+                firmware_version = adapter_info.get("firmwareVersion")
+                hardware_version = adapter_info.get("hardwareVersion")
+            except (KeyError, TypeError):
+                _LOGGER.debug("Device %s: could not retrieve adapter info", self._name)
+
+            # MHK2 humidity (optional)
+            if self._has_mhk2:
+                query = b'{"c":{"mhk2":{"status":{}}}}'
+                response = await self.request(query)
+                try:
+                    mhk2 = response.get("r", {}).get("mhk2")
+                    if isinstance(mhk2, dict) and mhk2.get("status"):
+                        mhk2_humidity = mhk2.get("status", {}).get("indoorHumid")
+                    else:
+                        self._has_mhk2 = False
+                except (KeyError, TypeError):
+                    self._has_mhk2 = False
+
+            self._profile_fetched = True
+        else:
+            # Subsequent polls: only fetch adapter status for wifi/run_state/uptime
+            query = b'{"c":{"adapter":{"status":{}}}}'
+            response = await self.request(query)
+            try:
+                adapter = response["r"]["adapter"]["status"]
+                try:
+                    wifi_rssi = adapter["localNetwork"]["stationMode"]["RSSI"]
+                except KeyError:
+                    wifi_rssi = None
+                run_state = adapter.get("runState")
+                uptime = adapter.get("uptime")
+            except (KeyError, TypeError):
+                _LOGGER.warning("Device %s: failed to retrieve adapter status", self._name)
+                wifi_rssi = self._status.wifi_rssi
+                run_state = self._status.run_state
+                uptime = self._status.uptime
+
+            # MHK2 humidity (optional, skip if previously returned no data)
+            if self._has_mhk2:
+                query = b'{"c":{"mhk2":{"status":{}}}}'
+                response = await self.request(query)
+                try:
+                    mhk2 = response.get("r", {}).get("mhk2")
+                    if isinstance(mhk2, dict) and mhk2.get("status"):
+                        mhk2_humidity = mhk2.get("status", {}).get("indoorHumid")
+                    else:
+                        self._has_mhk2 = False
+                except (KeyError, TypeError):
+                    self._has_mhk2 = False
+
+            # Carry forward cached values from previous status
+            min_cool_sp = self._status.min_cool_setpoint
+            max_cool_sp = self._status.max_cool_setpoint
+            min_heat_sp = self._status.min_heat_setpoint
+            max_heat_sp = self._status.max_heat_setpoint
+            firmware_version = self._status.firmware_version
+            hardware_version = self._status.hardware_version
 
         # Build status
         humidity = None
@@ -147,7 +210,6 @@ class IndoorUnit(Device):
         if humidity is None and mhk2_humidity is not None:
             humidity = mhk2_humidity
 
-        self._sensors = sensors
         self._status = DeviceStatus(
             mode=raw.get("mode"),
             standby=raw.get("standby"),
@@ -156,6 +218,7 @@ class IndoorUnit(Device):
             room_temperature=raw.get("roomTemp"),
             fan_speed=raw.get("fanSpeed"),
             vane_direction=raw.get("vaneDir"),
+            vane_left_right=raw.get("vaneLR"),
             filter_dirty=raw.get("filterDirty"),
             defrost=raw.get("defrost"),
             current_humidity=humidity,
@@ -163,6 +226,13 @@ class IndoorUnit(Device):
             sensor_battery=sensor_battery,
             sensor_rssi=sensor_rssi,
             run_state=run_state,
+            uptime=uptime,
+            firmware_version=firmware_version,
+            hardware_version=hardware_version,
+            min_cool_setpoint=min_cool_sp,
+            max_cool_setpoint=max_cool_sp,
+            min_heat_setpoint=min_heat_sp,
+            max_heat_setpoint=max_heat_sp,
         )
         return True
 

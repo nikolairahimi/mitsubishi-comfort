@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 
-from .const import MAX_SENSORS
 from .device import Device
 from .types import DeviceStatus
 
@@ -17,7 +16,6 @@ class KumoStation(Device):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._status = DeviceStatus()
-        self._sensors: list[dict] = []
 
     @property
     def status(self) -> DeviceStatus:
@@ -33,18 +31,7 @@ class KumoStation(Device):
             _LOGGER.warning("Device %s: failed to retrieve outdoor temperature", self._name)
             return False
 
-        sensors = []
-        for i in range(MAX_SENSORS):
-            query = f'{{"c":{{"sensors":{{"{i}":{{}}}}}}}}'.encode()
-            response = await self.request(query)
-            try:
-                sensor = response["r"]["sensors"][str(i)]
-                if isinstance(sensor, dict) and sensor.get("uuid"):
-                    sensors.append(sensor)
-                else:
-                    break
-            except (KeyError, TypeError):
-                break
+        sensors = await self._fetch_sensors()
 
         query = b'{"c":{"adapter":{"status":{}}}}'
         response = await self.request(query)
@@ -59,7 +46,6 @@ class KumoStation(Device):
                 sensor_rssi = sensor["rssi"]
                 break
 
-        self._sensors = sensors
         self._status = DeviceStatus(
             outdoor_temperature=outdoor_temp,
             wifi_rssi=wifi_rssi,

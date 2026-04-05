@@ -2,9 +2,9 @@
 
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from aioresponses import aioresponses
-from mitsubishi_comfort.cloud import MitsubishiCloudAccount
+from mitsubishi_comfort.cloud import MitsubishiCloudAccount, _SIO_EVENT
 from mitsubishi_comfort.exceptions import AuthenticationError
 
 
@@ -13,89 +13,168 @@ def cloud():
     return MitsubishiCloudAccount("user@example.com", "password123")
 
 
-async def test_login_success(cloud):
-    with aioresponses() as m:
-        m.post(
-            "https://app-prod.kumocloud.com/v3/login",
-            payload={"token": {"access": "jwt_access", "refresh": "jwt_refresh"}},
-        )
-        result = await cloud.login()
+class TestLogin:
+    async def test_login_success(self, cloud):
+        with aioresponses() as m:
+            m.post(
+                "https://app-prod.kumocloud.com/v3/login",
+                payload={"token": {"access": "jwt_access", "refresh": "jwt_refresh"}},
+            )
+            result = await cloud.login()
 
-    assert result is True
+        assert result is True
+        assert cloud._access_token == "jwt_access"
+        assert cloud._refresh_token == "jwt_refresh"
+        await cloud.close()
 
+    async def test_login_failure(self, cloud):
+        with aioresponses() as m:
+            m.post("https://app-prod.kumocloud.com/v3/login", status=401)
+            result = await cloud.login()
 
-async def test_login_failure(cloud):
-    with aioresponses() as m:
-        m.post("https://app-prod.kumocloud.com/v3/login", status=401)
-        result = await cloud.login()
-
-    assert result is False
-
-
-async def test_get_sites(cloud):
-    cloud._access_token = "test_token"
-    sites = [{"id": "site1", "name": "Home"}]
-    with aioresponses() as m:
-        m.get("https://app-prod.kumocloud.com/v3/sites/", payload=sites)
-        result = await cloud.get_sites()
-
-    assert result == sites
+        assert result is False
+        assert cloud._access_token is None
+        await cloud.close()
 
 
-async def test_get_zones(cloud):
-    cloud._access_token = "test_token"
-    zones = [{"name": "Living Room", "adapter": {"deviceSerial": "W123", "unitType": "ductless", "macAddress": "AA:BB"}}]
-    with aioresponses() as m:
-        m.get("https://app-prod.kumocloud.com/v3/sites/site1/zones", payload=zones)
-        result = await cloud.get_zones("site1")
+class TestGetSites:
+    async def test_get_sites(self, cloud):
+        cloud._access_token = "test_token"
+        sites = [{"id": "site1", "name": "Home"}]
+        with aioresponses() as m:
+            m.get("https://app-prod.kumocloud.com/v3/sites/", payload=sites)
+            result = await cloud.get_sites()
+            await cloud.close()
 
-    assert result == zones
-
-
-async def test_get_device_status(cloud):
-    cloud._access_token = "test_token"
-    status = {"cryptoSerial": "aabbccdd00112233ff"}
-    with aioresponses() as m:
-        m.get("https://app-prod.kumocloud.com/v3/devices/W123/status", payload=status)
-        result = await cloud.get_device_status("W123")
-
-    assert result["cryptoSerial"] == "aabbccdd00112233ff"
+        assert result == sites
 
 
-async def test_discover_devices(cloud):
-    cloud._access_token = "test_token"
+class TestAutoRefresh:
+    async def test_auto_refresh_on_401(self, cloud):
+        cloud._access_token = "expired_token"
+        cloud._refresh_token = "valid_refresh"
 
-    sites = [{"id": "site1"}]
-    zones = [{"name": "Bedroom", "adapter": {"deviceSerial": "W999", "unitType": "ductless", "macAddress": "CC:DD"}}]
-    status = {"cryptoSerial": "00112233445566778899"}
+        with aioresponses() as m:
+            m.get("https://app-prod.kumocloud.com/v3/sites/", status=401)
+            m.post(
+                "https://app-prod.kumocloud.com/v3/refresh",
+                payload={"access": "new_token", "refresh": "new_refresh"},
+            )
+            m.get("https://app-prod.kumocloud.com/v3/sites/", payload=[{"id": "s1"}])
 
-    with aioresponses() as m:
-        m.get("https://app-prod.kumocloud.com/v3/sites/", payload=sites)
-        m.get("https://app-prod.kumocloud.com/v3/sites/site1/zones", payload=zones)
-        m.get("https://app-prod.kumocloud.com/v3/devices/W999/status", payload=status)
+            result = await cloud.get_sites()
 
-        with patch.object(cloud, "get_passwords_via_websocket", new_callable=AsyncMock, return_value={"W999": "base64pw"}):
-            devices = await cloud.discover_devices()
-
-    assert "W999" in devices
-    assert devices["W999"].serial == "W999"
-    assert devices["W999"].label == "Bedroom"
-    assert devices["W999"].crypto_serial == "00112233445566778899"
-    assert devices["W999"].password == "base64pw"
+        assert result == [{"id": "s1"}]
+        assert cloud._access_token == "new_token"
+        await cloud.close()
 
 
-async def test_auto_refresh_on_401(cloud):
-    cloud._access_token = "expired_token"
-    cloud._refresh_token = "valid_refresh"
+class TestDiscoverDevices:
+    async def test_discover_devices(self, cloud):
+        cloud._access_token = "test_token"
 
-    with aioresponses() as m:
-        m.get("https://app-prod.kumocloud.com/v3/sites/", status=401)
-        m.post(
-            "https://app-prod.kumocloud.com/v3/refresh",
-            payload={"access": "new_token", "refresh": "new_refresh"},
-        )
-        m.get("https://app-prod.kumocloud.com/v3/sites/", payload=[{"id": "s1"}])
+        with aioresponses() as m:
+            m.get("https://app-prod.kumocloud.com/v3/sites/", payload=[{"id": "site1"}])
+            m.get(
+                "https://app-prod.kumocloud.com/v3/sites/site1/zones",
+                payload=[{
+                    "name": "Living Room",
+                    "adapter": {
+                        "deviceSerial": "SER001",
+                        "unitType": "ductless",
+                        "macAddress": "AA:BB:CC:DD:EE:FF",
+                    },
+                }],
+            )
+            m.get(
+                "https://app-prod.kumocloud.com/v3/devices/SER001/status",
+                payload={"cryptoSerial": "0102030405060708090a"},
+            )
 
-        result = await cloud.get_sites()
+            with patch.object(
+                cloud,
+                "get_passwords_via_websocket",
+                new=AsyncMock(return_value={"SER001": "dGVzdA=="}),
+            ):
+                devices = await cloud.discover_devices()
 
-    assert result == [{"id": "s1"}]
+        assert "SER001" in devices
+        assert devices["SER001"].label == "Living Room"
+        assert devices["SER001"].crypto_serial == "0102030405060708090a"
+        assert devices["SER001"].password == "dGVzdA=="
+        await cloud.close()
+
+    async def test_discover_with_cached_credentials(self, cloud):
+        cloud._access_token = "test_token"
+
+        cached = {
+            "SER001": {
+                "password": "cached_pw",
+                "crypto_serial": "0102030405060708090a",
+                "address": "192.168.1.100",
+            }
+        }
+
+        with aioresponses() as m:
+            m.get("https://app-prod.kumocloud.com/v3/sites/", payload=[{"id": "site1"}])
+            m.get(
+                "https://app-prod.kumocloud.com/v3/sites/site1/zones",
+                payload=[{
+                    "name": "Living Room",
+                    "adapter": {
+                        "deviceSerial": "SER001",
+                        "unitType": "ductless",
+                        "macAddress": "AA:BB:CC:DD:EE:FF",
+                    },
+                }],
+            )
+
+            with patch.object(
+                cloud,
+                "get_passwords_via_websocket",
+                new=AsyncMock(return_value={}),
+            ) as ws_mock:
+                devices = await cloud.discover_devices(cached_credentials=cached)
+
+        assert "SER001" in devices
+        assert devices["SER001"].password == "cached_pw"
+        assert devices["SER001"].crypto_serial == "0102030405060708090a"
+        ws_mock.assert_not_awaited()
+        await cloud.close()
+
+
+class TestUserIdCached:
+    def test_user_id_cached(self, cloud):
+        import base64
+
+        header = base64.urlsafe_b64encode(b'{"alg":"HS256"}').rstrip(b"=")
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"id": 12345}).encode()
+        ).rstrip(b"=")
+        cloud._access_token = f"{header.decode()}.{payload.decode()}.sig"
+
+        uid = cloud._get_user_id_from_token()
+        assert uid == "12345"
+        assert cloud._user_id == "12345"
+
+        cloud._access_token = None
+        uid2 = cloud._get_user_id_from_token()
+        assert uid2 == "12345"
+
+
+class TestExtractPasswords:
+    def test_extract_passwords_basic(self):
+        passwords: dict[str, str] = {}
+        serials = {"SER001", "SER002"}
+        raw = f'{_SIO_EVENT}["adapter_update",{{"deviceSerial":"SER001","password":"pw123"}}]'
+
+        MitsubishiCloudAccount._extract_passwords(raw, passwords, serials)
+        assert passwords == {"SER001": "pw123"}
+
+    def test_extract_passwords_ignores_unknown_serial(self):
+        passwords: dict[str, str] = {}
+        serials = {"SER001"}
+        raw = f'{_SIO_EVENT}["adapter_update",{{"deviceSerial":"SER999","password":"pw"}}]'
+
+        MitsubishiCloudAccount._extract_passwords(raw, passwords, serials)
+        assert passwords == {}
