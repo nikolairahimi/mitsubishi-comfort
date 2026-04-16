@@ -26,13 +26,15 @@ class Device:
         serial: str,
         connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
         response_timeout: float = DEFAULT_RESPONSE_TIMEOUT,
+        session: aiohttp.ClientSession | None = None,
     ) -> None:
         self._name = name
         self._address = address
         self._serial = serial
         self._connect_timeout = connect_timeout
         self._response_timeout = response_timeout
-        self._session: aiohttp.ClientSession | None = None
+        self._session = session
+        self._owns_session = session is None
 
         try:
             self._password = base64.b64decode(password_b64)
@@ -66,6 +68,7 @@ class Device:
                 sock_connect=self._connect_timeout,
                 sock_read=self._response_timeout,
             ))
+            self._owns_session = True
         return self._session
 
     async def _fetch_sensors(self) -> list[dict]:
@@ -86,8 +89,8 @@ class Device:
         return sensors
 
     async def close(self) -> None:
-        """Close the underlying HTTP session."""
-        if self._session and not self._session.closed:
+        """Close the underlying HTTP session if owned by this device."""
+        if self._owns_session and self._session and not self._session.closed:
             await self._session.close()
             self._session = None
 

@@ -18,7 +18,7 @@ from .const import (
     V3_CLOUD_TIMEOUT_READ,
     V3_SOCKET_URL,
 )
-from .exceptions import AuthenticationError
+from .exceptions import AuthenticationError, DeviceConnectionError
 from .types import DeviceInfo
 
 _LOGGER = logging.getLogger(__name__)
@@ -41,21 +41,33 @@ _SIO_CONNECT_ERROR = "44"
 class MitsubishiCloudAccount:
     """Async client for the Mitsubishi Comfort V3 cloud API."""
 
-    def __init__(self, username: str, password: str) -> None:
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        session: aiohttp.ClientSession | None = None,
+    ) -> None:
         self._username = username
         self._password = password
         self._access_token: str | None = None
         self._refresh_token: str | None = None
-        self._session: aiohttp.ClientSession | None = None
+        self._session = session
+        self._owns_session = session is None
         self._user_id: str | None = None
+
+    @property
+    def user_id(self) -> str | None:
+        """Cloud account user ID, resolved from the access token after login."""
+        return self._get_user_id_from_token()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=self._timeout())
+            self._owns_session = True
         return self._session
 
     async def close(self) -> None:
-        if self._session and not self._session.closed:
+        if self._owns_session and self._session and not self._session.closed:
             await self._session.close()
             self._session = None
 
@@ -70,8 +82,13 @@ class MitsubishiCloudAccount:
 
     # ── Authentication ──────────────────────────────────
 
-    async def login(self) -> bool:
-        """Authenticate with V3 API and obtain JWT tokens."""
+    async def login(self) -> None:
+        """Authenticate with V3 API and obtain JWT tokens.
+
+        Raises:
+            AuthenticationError: Credentials rejected or response missing tokens.
+            DeviceConnectionError: Network or transport failure.
+        """
         body = {
             "username": self._username,
             "password": self._password,
@@ -82,23 +99,29 @@ class MitsubishiCloudAccount:
             async with session.post(
                 f"{V3_BASE_URL}/v3/login", headers=_BASE_HEADERS, json=body
             ) as resp:
+                if resp.status in (401, 403):
+                    raise AuthenticationError(f"V3 login rejected: HTTP {resp.status}")
                 if not resp.ok:
-                    _LOGGER.warning("V3 login failed: HTTP %s", resp.status)
-                    return False
+                    raise DeviceConnectionError(f"V3 login failed: HTTP {resp.status}")
                 data = await resp.json()
-        except Exception as ex:
-            _LOGGER.warning("V3 login error: %s", ex)
-            return False
+        except (aiohttp.ClientError, TimeoutError) as ex:
+            raise DeviceConnectionError(f"V3 login error: {ex}") from ex
 
         token_data = data.get("token", {})
         self._access_token = token_data.get("access")
         self._refresh_token = token_data.get("refresh")
-        return bool(self._access_token)
+        if not self._access_token:
+            raise AuthenticationError("V3 login response missing access token")
 
-    async def refresh(self) -> bool:
-        """Refresh the access token using the refresh token."""
+    async def refresh(self) -> None:
+        """Refresh the access token using the refresh token.
+
+        Raises:
+            AuthenticationError: Refresh token rejected or missing.
+            DeviceConnectionError: Network or transport failure.
+        """
         if not self._refresh_token:
-            return False
+            raise AuthenticationError("No refresh token available")
 
         headers = {**_BASE_HEADERS, "Authorization": f"Bearer {self._refresh_token}"}
         try:
@@ -108,35 +131,51 @@ class MitsubishiCloudAccount:
                 headers=headers,
                 json={"refresh": self._refresh_token},
             ) as resp:
+                if resp.status in (401, 403):
+                    raise AuthenticationError(f"V3 refresh rejected: HTTP {resp.status}")
                 if not resp.ok:
-                    return False
+                    raise DeviceConnectionError(f"V3 refresh failed: HTTP {resp.status}")
                 data = await resp.json()
-        except Exception:
-            return False
+        except (aiohttp.ClientError, TimeoutError) as ex:
+            raise DeviceConnectionError(f"V3 refresh error: {ex}") from ex
 
         self._access_token = data.get("access")
         self._refresh_token = data.get("refresh")
-        return bool(self._access_token)
+        if not self._access_token:
+            raise AuthenticationError("V3 refresh response missing access token")
 
     # ── REST API ────────────────────────────────────────
 
     async def _get(self, path: str) -> Any:
-        """Authenticated GET with automatic token refresh on 401."""
+        """Authenticated GET with automatic token refresh on 401.
+
+        Raises:
+            AuthenticationError: Both original and refreshed requests rejected.
+            DeviceConnectionError: Network or transport failure.
+        """
         url = f"{V3_BASE_URL}{path}"
         try:
             session = await self._get_session()
             async with session.get(url, headers=self._auth_headers()) as resp:
-                if resp.status == 401 and await self.refresh():
+                if resp.status == 401:
+                    await self.refresh()
                     async with session.get(url, headers=self._auth_headers()) as retry_resp:
+                        if retry_resp.status in (401, 403):
+                            raise AuthenticationError(
+                                f"V3 GET {path} still unauthorized after refresh"
+                            )
                         if not retry_resp.ok:
-                            return None
+                            raise DeviceConnectionError(
+                                f"V3 GET {path} failed: HTTP {retry_resp.status}"
+                            )
                         return await retry_resp.json()
                 if not resp.ok:
-                    return None
+                    raise DeviceConnectionError(
+                        f"V3 GET {path} failed: HTTP {resp.status}"
+                    )
                 return await resp.json()
-        except Exception as ex:
-            _LOGGER.warning("V3 GET %s error: %s", path, ex)
-            return None
+        except (aiohttp.ClientError, TimeoutError) as ex:
+            raise DeviceConnectionError(f"V3 GET {path} error: {ex}") from ex
 
     async def get_sites(self) -> list[dict]:
         result = await self._get("/v3/sites/")
@@ -218,13 +257,14 @@ class MitsubishiCloudAccount:
         text = await _poll()
 
         if text.startswith(_SIO_CONNECT_ERROR):
-            if await self.refresh():
-                headers["Authorization"] = f"Bearer {self._access_token}"
-                post_headers["Authorization"] = f"Bearer {self._access_token}"
-                await _post(_SIO_CONNECT)
-                text = await _poll()
-            else:
+            try:
+                await self.refresh()
+            except (AuthenticationError, DeviceConnectionError):
                 return
+            headers["Authorization"] = f"Bearer {self._access_token}"
+            post_headers["Authorization"] = f"Bearer {self._access_token}"
+            await _post(_SIO_CONNECT)
+            text = await _poll()
 
         # Account subscribe
         user_id = self._get_user_id_from_token()
@@ -329,8 +369,8 @@ class MitsubishiCloudAccount:
 
         Returns dict mapping serial -> DeviceInfo.
         """
-        if not self._access_token and not await self.login():
-            raise AuthenticationError("V3 login failed")
+        if not self._access_token:
+            await self.login()
 
         cached = cached_credentials or {}
 

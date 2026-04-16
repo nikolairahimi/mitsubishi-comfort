@@ -1,11 +1,12 @@
 """Tests for mitsubishi_comfort.cloud."""
 
 import json
+import aiohttp
 import pytest
 from unittest.mock import AsyncMock, patch
 from aioresponses import aioresponses
 from mitsubishi_comfort.cloud import MitsubishiCloudAccount, _SIO_EVENT
-from mitsubishi_comfort.exceptions import AuthenticationError
+from mitsubishi_comfort.exceptions import AuthenticationError, DeviceConnectionError
 
 
 @pytest.fixture
@@ -20,20 +21,43 @@ class TestLogin:
                 "https://app-prod.kumocloud.com/v3/login",
                 payload={"token": {"access": "jwt_access", "refresh": "jwt_refresh"}},
             )
-            result = await cloud.login()
+            await cloud.login()
 
-        assert result is True
         assert cloud._access_token == "jwt_access"
         assert cloud._refresh_token == "jwt_refresh"
         await cloud.close()
 
-    async def test_login_failure(self, cloud):
+    async def test_login_rejected_raises_auth_error(self, cloud):
         with aioresponses() as m:
             m.post("https://app-prod.kumocloud.com/v3/login", status=401)
-            result = await cloud.login()
+            with pytest.raises(AuthenticationError):
+                await cloud.login()
 
-        assert result is False
         assert cloud._access_token is None
+        await cloud.close()
+
+    async def test_login_server_error_raises_connection_error(self, cloud):
+        with aioresponses() as m:
+            m.post("https://app-prod.kumocloud.com/v3/login", status=503)
+            with pytest.raises(DeviceConnectionError):
+                await cloud.login()
+        await cloud.close()
+
+    async def test_login_network_error_raises_connection_error(self, cloud):
+        with aioresponses() as m:
+            m.post(
+                "https://app-prod.kumocloud.com/v3/login",
+                exception=aiohttp.ClientError("boom"),
+            )
+            with pytest.raises(DeviceConnectionError):
+                await cloud.login()
+        await cloud.close()
+
+    async def test_login_missing_token_raises_auth_error(self, cloud):
+        with aioresponses() as m:
+            m.post("https://app-prod.kumocloud.com/v3/login", payload={"token": {}})
+            with pytest.raises(AuthenticationError):
+                await cloud.login()
         await cloud.close()
 
 
@@ -160,6 +184,42 @@ class TestUserIdCached:
         cloud._access_token = None
         uid2 = cloud._get_user_id_from_token()
         assert uid2 == "12345"
+
+
+class TestSessionInjection:
+    async def test_external_session_not_closed(self):
+        async with aiohttp.ClientSession() as external:
+            cloud = MitsubishiCloudAccount("u", "p", session=external)
+            await cloud.close()
+            assert not external.closed
+
+    async def test_owned_session_closed(self):
+        cloud = MitsubishiCloudAccount("u", "p")
+        with aioresponses() as m:
+            m.post(
+                "https://app-prod.kumocloud.com/v3/login",
+                payload={"token": {"access": "t", "refresh": "r"}},
+            )
+            await cloud.login()
+        owned = cloud._session
+        await cloud.close()
+        assert owned is not None and owned.closed
+
+
+class TestUserIdProperty:
+    def test_user_id_property_exposes_cached_value(self, cloud):
+        import base64
+
+        header = base64.urlsafe_b64encode(b'{"alg":"HS256"}').rstrip(b"=")
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"id": 99}).encode()
+        ).rstrip(b"=")
+        cloud._access_token = f"{header.decode()}.{payload.decode()}.sig"
+
+        assert cloud.user_id == "99"
+
+    def test_user_id_none_without_token(self, cloud):
+        assert cloud.user_id is None
 
 
 class TestExtractPasswords:

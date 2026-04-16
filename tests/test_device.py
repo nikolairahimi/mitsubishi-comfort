@@ -58,6 +58,21 @@ async def test_request_no_address():
     assert result == {}
 
 
+async def test_external_session_not_closed(device_credentials, device_serial):
+    import aiohttp
+    async with aiohttp.ClientSession() as external:
+        device = Device(
+            name="External Session",
+            address="192.168.1.50",
+            password_b64=device_credentials["password"],
+            crypto_serial_hex=device_credentials["crypto_serial"],
+            serial=device_serial,
+            session=external,
+        )
+        await device.close()
+        assert not external.closed
+
+
 async def test_device_set_timeouts(device_credentials, device_serial):
     device = Device(
         name="Custom Timeouts",
