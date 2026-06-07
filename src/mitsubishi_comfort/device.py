@@ -49,6 +49,14 @@ class Device:
             _LOGGER.warning("Device %s: invalid hex crypto serial, disabling requests", name)
             self._crypto_serial = bytearray()
             self._address = None
+        else:
+            if len(self._crypto_serial) < 9:
+                _LOGGER.warning(
+                    "Device %s: crypto serial too short (%d bytes), disabling requests",
+                    name,
+                    len(self._crypto_serial),
+                )
+                self._address = None
 
     @property
     def name(self) -> str:
