@@ -364,8 +364,10 @@ class MitsubishiCloudAccount:
         """Discover all devices on this account.
 
         Args:
-            cached_credentials: Optional dict of serial -> {password, crypto_serial, ...}.
-                Devices with cached credentials skip the Socket.IO password retrieval.
+            cached_credentials: Optional dict of serial -> {password, crypto_serial,
+                mac, address, ...}. A cached password skips the Socket.IO password
+                retrieval; a cached crypto_serial and mac skip the per-device status
+                fetch they would otherwise be read from.
 
         Returns dict mapping serial -> DeviceInfo.
         """
@@ -385,8 +387,8 @@ class MitsubishiCloudAccount:
                 if serial:
                     devices[serial] = {
                         "label": zone.get("name", ""),
-                        "unit_type": adapter.get("unitType", "ductless"),
-                        "mac": adapter.get("macAddress", ""),
+                        "unit_type": "headless" if adapter.get("isHeadless") else "ductless",
+                        "mac": cached.get(serial, {}).get("mac", ""),
                         "password": cached.get(serial, {}).get("password", ""),
                         "crypto_serial": cached.get(serial, {}).get("crypto_serial", ""),
                     }
@@ -395,17 +397,26 @@ class MitsubishiCloudAccount:
             _LOGGER.warning("No devices found via V3 API")
             return {}
 
-        # Get cryptoSerials for devices that don't have one cached
-        missing_crypto = [(s, d) for s, d in devices.items() if not d["crypto_serial"]]
-        if missing_crypto:
+        # The V3 adapter object exposes neither the cryptoSerial nor the device's
+        # LAN MAC address; both come from the per-device status endpoint. Fetch it
+        # for any device still missing either (cached_credentials may supply them).
+        need_status = [
+            (s, d)
+            for s, d in devices.items()
+            if not d["crypto_serial"] or not d["mac"]
+        ]
+        if need_status:
             results = await asyncio.gather(
-                *[self.get_device_status(s) for s, _ in missing_crypto]
+                *[self.get_device_status(s) for s, _ in need_status]
             )
-            for (serial, dev), status in zip(missing_crypto, results):
+            for (serial, dev), status in zip(need_status, results):
                 if isinstance(status, dict):
                     crypto = status.get("cryptoSerial", "")
                     if crypto:
                         dev["crypto_serial"] = crypto
+                    mac = status.get("mac", "")
+                    if mac:
+                        dev["mac"] = mac
 
         # Only fetch passwords via Socket.IO for devices missing them
         need_passwords = [s for s, d in devices.items() if not d["password"]]

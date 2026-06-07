@@ -56,3 +56,23 @@ async def test_probe_no_match(devices):
         )
 
     assert result == {}
+
+
+async def test_probe_matches_multiple_across_candidates(devices):
+    # Each unit only authenticates against its own IP; concurrent probing must
+    # still map every device to the correct address.
+    async def fake_probe(ip, password, crypto_serial, timeout):
+        if ip == "192.168.1.10" and password == devices["W111"].password:
+            return True
+        if ip == "192.168.1.20" and password == devices["W222"].password:
+            return True
+        return False
+
+    with patch("mitsubishi_comfort.discovery._probe_ip", side_effect=fake_probe):
+        result = await probe_candidate_ips(
+            devices,
+            ["192.168.1.10", "192.168.1.20", "192.168.1.30"],
+            timeout=1.0,
+        )
+
+    assert result == {"W111": "192.168.1.10", "W222": "192.168.1.20"}

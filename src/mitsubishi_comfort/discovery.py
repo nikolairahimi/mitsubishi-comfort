@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 
@@ -19,27 +20,41 @@ async def probe_candidate_ips(
     devices: dict[str, DeviceInfo],
     candidate_ips: list[str],
     timeout: float = 3.0,
+    max_concurrent: int = 64,
 ) -> dict[str, str]:
-    """Probe candidate IPs to match device serials to LAN addresses.
+    """Probe candidate IPs concurrently to match device serials to LAN addresses.
+
+    Each device only authenticates against its own unit, so every (device, ip)
+    pair is probed concurrently — bounded by ``max_concurrent`` — and the first
+    IP a device authenticates against wins. This relies on L3 HTTP rather than
+    L2 discovery, so it resolves units on other subnets/VLANs as long as they
+    are routable from this host.
 
     Returns dict mapping serial -> IP address.
     """
     if not devices or not candidate_ips:
         return {}
 
+    semaphore = asyncio.Semaphore(max_concurrent)
     result: dict[str, str] = {}
-    unmatched = set(devices.keys())
 
-    for ip in candidate_ips:
-        if not unmatched:
-            break
-        for serial in list(unmatched):
-            dev = devices[serial]
+    async def _match(serial: str, dev: DeviceInfo, ip: str) -> None:
+        if serial in result:  # already found elsewhere; skip the probe
+            return
+        async with semaphore:
+            if serial in result:
+                return
             if await _probe_ip(ip, dev.password, dev.crypto_serial, timeout):
-                result[serial] = ip
-                unmatched.discard(serial)
-                _LOGGER.info("Matched %s -> %s", serial, ip)
-                break
+                if result.setdefault(serial, ip) == ip:
+                    _LOGGER.info("Matched %s -> %s", serial, ip)
+
+    await asyncio.gather(
+        *(
+            _match(serial, dev, ip)
+            for serial, dev in devices.items()
+            for ip in candidate_ips
+        )
+    )
 
     return result
 

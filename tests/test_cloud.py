@@ -105,14 +105,19 @@ class TestDiscoverDevices:
                     "name": "Living Room",
                     "adapter": {
                         "deviceSerial": "SER001",
-                        "unitType": "ductless",
-                        "macAddress": "AA:BB:CC:DD:EE:FF",
+                        "isHeadless": False,
+                        # The V3 adapter never carries a usable macAddress; the
+                        # real MAC comes from the device status endpoint below.
+                        "macAddress": "",
                     },
                 }],
             )
             m.get(
                 "https://app-prod.kumocloud.com/v3/devices/SER001/status",
-                payload={"cryptoSerial": "0102030405060708090a"},
+                payload={
+                    "cryptoSerial": "0102030405060708090a",
+                    "mac": "24:cd:8d:1e:7b:15",
+                },
             )
 
             with patch.object(
@@ -126,6 +131,9 @@ class TestDiscoverDevices:
         assert devices["SER001"].label == "Living Room"
         assert devices["SER001"].crypto_serial == "0102030405060708090a"
         assert devices["SER001"].password == "dGVzdA=="
+        # MAC is read from the status endpoint, not the adapter object.
+        assert devices["SER001"].mac == "24:cd:8d:1e:7b:15"
+        assert devices["SER001"].is_indoor_unit is True
         await cloud.close()
 
     async def test_discover_with_cached_credentials(self, cloud):
@@ -135,6 +143,7 @@ class TestDiscoverDevices:
             "SER001": {
                 "password": "cached_pw",
                 "crypto_serial": "0102030405060708090a",
+                "mac": "24:cd:8d:1e:7b:15",
                 "address": "192.168.1.100",
             }
         }
@@ -145,11 +154,7 @@ class TestDiscoverDevices:
                 "https://app-prod.kumocloud.com/v3/sites/site1/zones",
                 payload=[{
                     "name": "Living Room",
-                    "adapter": {
-                        "deviceSerial": "SER001",
-                        "unitType": "ductless",
-                        "macAddress": "AA:BB:CC:DD:EE:FF",
-                    },
+                    "adapter": {"deviceSerial": "SER001", "isHeadless": False},
                 }],
             )
 
@@ -163,7 +168,41 @@ class TestDiscoverDevices:
         assert "SER001" in devices
         assert devices["SER001"].password == "cached_pw"
         assert devices["SER001"].crypto_serial == "0102030405060708090a"
+        # A cached mac (and crypto) means no per-device status fetch is needed —
+        # note no status endpoint is mocked above.
+        assert devices["SER001"].mac == "24:cd:8d:1e:7b:15"
         ws_mock.assert_not_awaited()
+        await cloud.close()
+
+    async def test_discover_headless_unit_type_from_is_headless(self, cloud):
+        cloud._access_token = "test_token"
+
+        with aioresponses() as m:
+            m.get("https://app-prod.kumocloud.com/v3/sites/", payload=[{"id": "site1"}])
+            m.get(
+                "https://app-prod.kumocloud.com/v3/sites/site1/zones",
+                payload=[{
+                    "name": "Outdoor",
+                    "adapter": {"deviceSerial": "SER002", "isHeadless": True},
+                }],
+            )
+            m.get(
+                "https://app-prod.kumocloud.com/v3/devices/SER002/status",
+                payload={
+                    "cryptoSerial": "0102030405060708090a",
+                    "mac": "9c:50:d1:ef:11:29",
+                },
+            )
+
+            with patch.object(
+                cloud,
+                "get_passwords_via_websocket",
+                new=AsyncMock(return_value={"SER002": "dGVzdA=="}),
+            ):
+                devices = await cloud.discover_devices()
+
+        assert devices["SER002"].unit_type == "headless"
+        assert devices["SER002"].is_indoor_unit is False
         await cloud.close()
 
 
