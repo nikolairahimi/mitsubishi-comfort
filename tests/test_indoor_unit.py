@@ -249,6 +249,68 @@ class TestSupportedModes:
         assert modes == [Mode.OFF, Mode.COOL]
 
 
+class TestAutoModeGating:
+    """Auto mode is gated on autoModePrevention but falls back to setpoints.
+
+    A unit can report ``autoModePrevention=True`` and still support auto
+    changeover (the Mitsubishi Comfort app keeps offering it); the profile's
+    auto setpoint range is the ground truth. Regression for
+    home-assistant/core#174091.
+    """
+
+    async def _poll(self, profile_overrides: dict, adapter_overrides: dict) -> IndoorUnit:
+        unit = _make_unit()
+        unit.request = AsyncMock(
+            side_effect=[
+                _status_response(),
+                {},  # sensors
+                _profile_response(**profile_overrides),
+                _adapter_status_response(**adapter_overrides),
+                _adapter_info_response(),
+                _mhk2_response(),
+            ]
+        )
+        await unit.update_status()
+        return unit
+
+    async def test_auto_available_when_not_prevented(self):
+        """No prevention flag -> auto stays available."""
+        unit = await self._poll({}, {"autoModePrevention": False})
+        assert Mode.AUTO in unit.supported_modes
+
+    async def test_auto_dropped_when_prevented_without_auto_setpoints(self):
+        """Prevention with no auto setpoint range -> auto genuinely unavailable."""
+        unit = await self._poll({}, {"autoModePrevention": True})
+        assert Mode.AUTO not in unit.supported_modes
+
+    async def test_auto_kept_when_prevented_but_auto_setpoints_present(self):
+        """Prevention but an 'auto' setpoint range -> auto is still supported."""
+        unit = await self._poll(
+            {
+                "minimumSetPoints": {"cool": 18.0, "heat": 16.0, "auto": 17.0},
+                "maximumSetPoints": {"cool": 30.0, "heat": 28.0, "auto": 29.0},
+            },
+            {"autoModePrevention": True},
+        )
+        assert Mode.AUTO in unit.supported_modes
+
+    async def test_auto_kept_when_only_one_auto_setpoint_bound_present(self):
+        """Either min or max carrying an 'auto' key is enough."""
+        unit = await self._poll(
+            {"minimumSetPoints": {"cool": 18.0, "heat": 16.0, "auto": 17.0}},
+            {"autoModePrevention": True},
+        )
+        assert Mode.AUTO in unit.supported_modes
+
+    def test_compute_has_mode_auto_contract(self):
+        unit = _make_unit()
+        unit._profile = {"minimumSetPoints": {}, "maximumSetPoints": {}}
+        assert unit._compute_has_mode_auto(False) is True
+        assert unit._compute_has_mode_auto(True) is False
+        unit._profile = {"minimumSetPoints": {"auto": 17.0}, "maximumSetPoints": {}}
+        assert unit._compute_has_mode_auto(True) is True
+
+
 class TestSupportedFanSpeeds:
     def test_4_speed_config(self):
         unit = _make_unit()

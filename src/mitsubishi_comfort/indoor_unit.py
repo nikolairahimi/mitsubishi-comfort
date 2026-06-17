@@ -52,6 +52,21 @@ class IndoorUnit(Device):
             modes.append(Mode.AUTO)
         return modes
 
+    def _compute_has_mode_auto(self, auto_mode_prevention: bool) -> bool:
+        """Whether the unit supports auto (heat/cool changeover) mode.
+
+        The adapter's ``autoModePrevention`` flag is honored, but some installer
+        configurations report it ``True`` even though the unit (and the
+        Mitsubishi Comfort app) still treat auto as supported. In that case the
+        unit profile's auto setpoint range is the ground truth, so fall back to
+        checking ``minimumSetPoints``/``maximumSetPoints`` for an ``"auto"`` key.
+        """
+        if not auto_mode_prevention:
+            return True
+        min_sp = self._profile.get("minimumSetPoints", {}) or {}
+        max_sp = self._profile.get("maximumSetPoints", {}) or {}
+        return "auto" in min_sp or "auto" in max_sp
+
     @property
     def supported_fan_speeds(self) -> list[FanSpeed]:
         count = self._profile.get("numberOfFanSpeeds", 5)
@@ -118,7 +133,9 @@ class IndoorUnit(Device):
             response = await self.request(query)
             try:
                 adapter = response["r"]["adapter"]["status"]
-                self._profile["hasModeAuto"] = not adapter.get("autoModePrevention", False)
+                self._profile["hasModeAuto"] = self._compute_has_mode_auto(
+                    adapter.get("autoModePrevention", False)
+                )
                 if not adapter.get("userHasModeDry", False):
                     self._profile["hasModeDry"] = False
                 if not adapter.get("userHasModeHeat", False):
