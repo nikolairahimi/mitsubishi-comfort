@@ -91,6 +91,24 @@ asyncio.run(main())
 
 `probe_candidate_ips(devices, candidate_ips)` matches device serials to LAN IP addresses by probing with device credentials.
 
+## Acknowledgments
+
+This library builds on the protocol work of [pykumo](https://github.com/dlarrick/pykumo)
+by Doug Larrick and contributors, which reverse-engineered the Kumo Cloud service and
+the local HTTP API used by Mitsubishi WiFi adapters. In particular:
+
+- The local API auth token computation (`auth.py`) is derived from pykumo's
+  `PyKumoBase._token`.
+- The V3 cloud client (`cloud.py`), including the Socket.IO credential retrieval
+  flow, is an async adaptation of pykumo's V3 support contributed by Ethan Kiczek.
+- The credential-probe approach to matching device serials to LAN addresses
+  (`discovery.py`) follows pykumo's local discovery design.
+
+mitsubishi-comfort exists as a separate library because it targets asyncio
+applications (notably Home Assistant), which requires a different architecture
+than pykumo's synchronous design. If you need a synchronous client, use pykumo.
+
 ## License
 
-MIT
+MIT. Portions derived from pykumo, Copyright (c) 2019 dlarrick, also under the
+MIT license — see the third-party notices in [LICENSE](LICENSE).
