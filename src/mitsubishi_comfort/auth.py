@@ -1,4 +1,8 @@
-"""Auth token computation for the Mitsubishi local HTTP API."""
+"""Auth token computation for the Mitsubishi local HTTP API.
+
+Derived from pykumo's PyKumoBase._token (https://github.com/dlarrick/pykumo,
+MIT License, Copyright (c) 2019 dlarrick). See LICENSE for the full notice.
+"""
 
 import hashlib
 

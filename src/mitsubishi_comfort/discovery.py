@@ -1,4 +1,9 @@
-"""Local network IP probing to match device serials to LAN addresses."""
+"""Local network IP probing to match device serials to LAN addresses.
+
+The credential-probe approach follows pykumo's local discovery design
+(https://github.com/dlarrick/pykumo, MIT License, Copyright (c) 2019 dlarrick).
+See LICENSE for the full notice.
+"""
 
 from __future__ import annotations
 

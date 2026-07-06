@@ -1,4 +1,9 @@
-"""V3 Cloud API client for Mitsubishi Comfort (Kumo Cloud)."""
+"""V3 Cloud API client for Mitsubishi Comfort (Kumo Cloud).
+
+Async adaptation of pykumo's V3 API support (https://github.com/dlarrick/pykumo,
+MIT License, Copyright (c) 2019 dlarrick), originally contributed to pykumo by
+Ethan Kiczek. See LICENSE for the full notice.
+"""
 
 from __future__ import annotations
 

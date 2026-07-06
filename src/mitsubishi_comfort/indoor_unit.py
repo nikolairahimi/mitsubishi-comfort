@@ -60,6 +60,9 @@ class IndoorUnit(Device):
         Mitsubishi Comfort app) still treat auto as supported. In that case the
         unit profile's auto setpoint range is the ground truth, so fall back to
         checking ``minimumSetPoints``/``maximumSetPoints`` for an ``"auto"`` key.
+
+        Ported from pykumo's fix of the same issue (dlarrick/pykumo commit
+        211b4fc, contributed by Jon Gordner).
         """
         if not auto_mode_prevention:
             return True
