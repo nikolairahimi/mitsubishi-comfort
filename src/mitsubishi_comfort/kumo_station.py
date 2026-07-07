@@ -21,8 +21,8 @@ class KumoStation(Device):
     def status(self) -> DeviceStatus:
         return self._status
 
-    async def update_status(self) -> bool:
-        """Poll the station for outdoor temperature, sensors, and WiFi RSSI."""
+    async def _refresh_status(self) -> bool:
+        """Fetch outdoor temperature, sensors, and WiFi RSSI. Returns True on success."""
         query = b'{"c":{"eqc":{"oat":{}}}}'
         response = await self.request(query)
         try:

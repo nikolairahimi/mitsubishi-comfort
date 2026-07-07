@@ -140,6 +140,28 @@ class TestUpdateStatus:
         result = await unit.update_status()
         assert result is False
 
+    async def test_update_status_disconnects_when_done(self):
+        """The adapter's connection slot is freed at the end of every poll."""
+        unit = _make_unit()
+        unit.disconnect = AsyncMock()
+
+        unit.request = AsyncMock(side_effect=[
+            _status_response(),
+            {},  # sensors
+            _profile_response(),
+            _adapter_status_response(),
+            _adapter_info_response(),
+            _mhk2_response(),
+        ])
+        await unit.update_status()
+        unit.disconnect.assert_awaited_once()
+
+        # also on a failed poll
+        unit.disconnect.reset_mock()
+        unit.request = AsyncMock(return_value={})
+        await unit.update_status()
+        unit.disconnect.assert_awaited_once()
+
     async def test_profile_cached_after_first_poll(self):
         """Profile only fetched once."""
         unit = _make_unit()
@@ -170,6 +192,100 @@ class TestUpdateStatus:
         # Profile limits carried forward
         assert unit.status.min_cool_setpoint == 18.0
 
+    async def test_profile_parses_auto_setpoint_range(self):
+        """The 'auto' setpoint range is read alongside cool/heat."""
+        unit = _make_unit()
+        unit.request = AsyncMock(side_effect=[
+            _status_response(),
+            {},  # sensors
+            _profile_response(
+                minimumSetPoints={"cool": 18.0, "heat": 16.0, "auto": 10.0},
+                maximumSetPoints={"cool": 30.0, "heat": 28.0, "auto": 31.0},
+            ),
+            _adapter_status_response(),
+            _adapter_info_response(),
+            _mhk2_response(),
+        ])
+        await unit.update_status()
+        assert unit.status.min_auto_setpoint == 10.0
+        assert unit.status.max_auto_setpoint == 31.0
+
+    async def test_profile_string_bounds_coerced_to_float(self):
+        """Stringified profile limits are coerced so range checks can't crash."""
+        unit = _make_unit()
+        unit.request = AsyncMock(side_effect=[
+            _status_response(),
+            {},  # sensors
+            _profile_response(
+                minimumSetPoints={"cool": "18", "heat": "warm"},
+                maximumSetPoints={"cool": "30"},
+            ),
+            _adapter_status_response(),
+            _adapter_info_response(),
+            _mhk2_response(),
+        ])
+        await unit.update_status()
+        assert unit.status.min_cool_setpoint == 18.0
+        assert unit.status.max_cool_setpoint == 30.0
+        # Non-numeric bound falls back to None (unenforced) rather than crashing.
+        assert unit.status.min_heat_setpoint is None
+
+    async def test_profile_refetched_after_interval(self):
+        """Cached profile self-heals: it is re-fetched every PROFILE_REFRESH_POLLS."""
+        from mitsubishi_comfort.const import PROFILE_REFRESH_POLLS
+
+        full_poll = [
+            _status_response(),
+            {},  # sensors
+            _profile_response(),
+            _adapter_status_response(),
+            _adapter_info_response(),
+            _mhk2_response(),
+        ]
+        unit = _make_unit()
+        unit.request = AsyncMock(side_effect=list(full_poll))
+        await unit.update_status()
+        assert unit._polls_since_profile == 0
+
+        # A normal poll takes the short path and increments the counter.
+        unit.request = AsyncMock(side_effect=[
+            _status_response(), {}, _adapter_status_response(), _mhk2_response(),
+        ])
+        await unit.update_status()
+        assert unit._polls_since_profile == 1
+
+        # At the threshold the next poll re-fetches the profile (full set) and
+        # resets the counter; if it had not, the profile response would be
+        # misread and the counter would not return to 0.
+        unit._polls_since_profile = PROFILE_REFRESH_POLLS
+        unit.request = AsyncMock(side_effect=list(full_poll))
+        result = await unit.update_status()
+        assert result is True
+        assert unit._polls_since_profile == 0
+
+    async def test_profile_refresh_failure_is_non_fatal(self):
+        """A failed periodic re-fetch keeps cached bounds and the poll succeeds."""
+        from mitsubishi_comfort.const import PROFILE_REFRESH_POLLS
+
+        unit = _make_unit()
+        unit.request = AsyncMock(side_effect=[
+            _status_response(), {}, _profile_response(),
+            _adapter_status_response(), _adapter_info_response(), _mhk2_response(),
+        ])
+        await unit.update_status()
+        assert unit.status.min_cool_setpoint == 18.0
+
+        # At the refresh interval the profile fetch returns junk.
+        unit._polls_since_profile = PROFILE_REFRESH_POLLS
+        unit.request = AsyncMock(side_effect=[
+            _status_response(mode="cool"), {},
+            {},  # profile fetch fails
+            _adapter_status_response(), _adapter_info_response(), _mhk2_response(),
+        ])
+        result = await unit.update_status()
+        assert result is True
+        assert unit.status.min_cool_setpoint == 18.0  # cached bounds retained
+
 
 class TestSetCommands:
     async def test_set_mode_success(self):
@@ -180,6 +296,17 @@ class TestSetCommands:
         result = await unit.set_mode(Mode.HEAT)
         assert result.success is True
         assert result.value == "heat"
+        call_data = unit.request.call_args[0][0]
+        assert b'"mode":"heat"' in call_data
+
+    async def test_set_command_disconnects(self):
+        unit = _make_unit()
+        unit._profile = {"hasModeHeat": True}
+        unit.request = AsyncMock(return_value={"r": {"indoorUnit": {"status": {}}}})
+        unit.disconnect = AsyncMock()
+
+        await unit.set_mode(Mode.HEAT)
+        unit.disconnect.assert_awaited_once()
 
     async def test_set_mode_unsupported(self):
         unit = _make_unit()
@@ -206,6 +333,76 @@ class TestSetCommands:
         assert result.success is True
         assert result.value == 20.0
 
+    async def test_set_cool_setpoint_within_profile_range(self):
+        unit = _make_unit()
+        unit._status.min_cool_setpoint = 18.0
+        unit._status.max_cool_setpoint = 30.0
+        unit.request = AsyncMock(return_value={"r": {"indoorUnit": {"status": {}}}})
+
+        result = await unit.set_cool_setpoint(24.0)
+        assert result.success is True
+
+    async def test_set_cool_setpoint_above_max_rejected(self):
+        unit = _make_unit()
+        unit._status.min_cool_setpoint = 18.0
+        unit._status.max_cool_setpoint = 30.0
+        unit.request = AsyncMock()
+
+        result = await unit.set_cool_setpoint(40.0)
+        assert result.success is False
+        unit.request.assert_not_awaited()
+
+    async def test_set_cool_setpoint_accepts_value_in_auto_range(self):
+        """A value above the cool max but within the wider auto range is sent."""
+        unit = _make_unit()
+        unit._status.min_cool_setpoint = 18.0
+        unit._status.max_cool_setpoint = 30.0
+        unit._status.min_auto_setpoint = 10.0
+        unit._status.max_auto_setpoint = 31.0
+        unit.request = AsyncMock(return_value={"r": {"indoorUnit": {"status": {}}}})
+
+        result = await unit.set_cool_setpoint(31.0)
+        assert result.success is True
+
+    async def test_set_cool_setpoint_rejected_outside_every_range(self):
+        unit = _make_unit()
+        unit._status.min_cool_setpoint = 18.0
+        unit._status.max_cool_setpoint = 30.0
+        unit._status.min_auto_setpoint = 10.0
+        unit._status.max_auto_setpoint = 31.0
+        unit.request = AsyncMock()
+
+        result = await unit.set_cool_setpoint(40.0)
+        assert result.success is False
+        unit.request.assert_not_awaited()
+
+    async def test_set_heat_setpoint_below_min_rejected(self):
+        unit = _make_unit()
+        unit._status.min_heat_setpoint = 16.0
+        unit._status.max_heat_setpoint = 28.0
+        unit.request = AsyncMock()
+
+        result = await unit.set_heat_setpoint(5.0)
+        assert result.success is False
+        unit.request.assert_not_awaited()
+
+    @pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+    async def test_set_setpoint_non_finite_rejected(self, bad):
+        unit = _make_unit()
+        unit.request = AsyncMock()
+
+        result = await unit.set_cool_setpoint(bad)
+        assert result.success is False
+        unit.request.assert_not_awaited()
+
+    async def test_set_command_empty_response_fails_cleanly(self):
+        """request() normalizes junk bodies to {}, so a command just fails."""
+        unit = _make_unit()
+        unit.request = AsyncMock(return_value={})
+
+        result = await unit.set_cool_setpoint(22.5)
+        assert result.success is False
+
     async def test_set_fan_speed(self):
         unit = _make_unit()
         unit._profile = {"numberOfFanSpeeds": 5, "hasFanSpeedAuto": True}
@@ -215,6 +412,16 @@ class TestSetCommands:
         assert result.success is True
         assert result.value == "auto"
 
+    async def test_set_fan_speed_unsupported(self):
+        unit = _make_unit()
+        # 3-speed unit without auto -> AUTO is not a supported speed.
+        unit._profile = {"numberOfFanSpeeds": 3, "hasFanSpeedAuto": False}
+        unit.request = AsyncMock()
+
+        result = await unit.set_fan_speed(FanSpeed.AUTO)
+        assert result.success is False
+        unit.request.assert_not_awaited()
+
     async def test_set_vane_direction(self):
         unit = _make_unit()
         unit._profile = {"hasVaneDir": True, "hasVaneSwing": True}
@@ -223,6 +430,16 @@ class TestSetCommands:
         result = await unit.set_vane_direction(VaneDirection.SWING)
         assert result.success is True
         assert result.value == "swing"
+
+    async def test_set_vane_direction_unsupported(self):
+        unit = _make_unit()
+        # No vane control -> supported_vane_directions is empty.
+        unit._profile = {}
+        unit.request = AsyncMock()
+
+        result = await unit.set_vane_direction(VaneDirection.SWING)
+        assert result.success is False
+        unit.request.assert_not_awaited()
 
 
 class TestSupportedModes:

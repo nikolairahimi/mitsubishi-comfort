@@ -42,3 +42,40 @@ class TestUpdateStatus:
 
         result = await station.update_status()
         assert result is False
+
+    async def test_disconnects_when_done(self):
+        """The adapter's connection slot is freed at the end of every poll."""
+        station = _make_station()
+        station.request = AsyncMock(return_value={})
+        station.disconnect = AsyncMock()
+
+        await station.update_status()
+        station.disconnect.assert_awaited_once()
+
+    async def test_sensor_rssi_from_external_sensor(self):
+        """An external sensor's RSSI is surfaced on the status snapshot."""
+        station = _make_station()
+        station.request = AsyncMock(side_effect=[
+            {"r": {"eqc": {"oat": 15.5}}},
+            {"r": {"sensors": {"0": {"uuid": "abc", "rssi": -50}}}},
+            {},  # sensor slot 1 -> break
+            {"r": {"adapter": {"status": {"localNetwork": {"stationMode": {"RSSI": -40}}}}}},
+        ])
+
+        result = await station.update_status()
+        assert result is True
+        assert station.status.sensor_rssi == -50
+        assert station.status.wifi_rssi == -40
+
+    async def test_wifi_rssi_none_when_adapter_status_malformed(self):
+        """A missing RSSI path leaves wifi_rssi None without failing the poll."""
+        station = _make_station()
+        station.request = AsyncMock(side_effect=[
+            {"r": {"eqc": {"oat": 15.5}}},
+            {},  # no sensors
+            {"r": {"adapter": {"status": {}}}},  # no localNetwork -> None
+        ])
+
+        result = await station.update_status()
+        assert result is True
+        assert station.status.wifi_rssi is None

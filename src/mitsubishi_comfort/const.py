@@ -16,6 +16,11 @@ CACHE_INTERVAL_SECONDS = 20
 # Maximum number of external sensors per unit
 MAX_SENSORS = 4
 
+# Re-fetch the unit profile (capabilities and setpoint limits) every this many
+# polls so cached bounds self-heal after a firmware/config change. At the
+# typical ~60s poll cadence this is roughly hourly.
+PROFILE_REFRESH_POLLS = 60
+
 # V3 Cloud API
 V3_BASE_URL = "https://app-prod.kumocloud.com"
 V3_SOCKET_URL = "https://socket-prod.kumocloud.com"

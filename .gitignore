@@ -13,3 +13,12 @@ build/
 .venv/
 venv/
 *.whl
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# macOS
+.DS_Store

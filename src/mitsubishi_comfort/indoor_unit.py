@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 
+from .const import PROFILE_REFRESH_POLLS
 from .device import Device
 from .types import CommandResult, DeviceStatus, FanSpeed, Mode, VaneDirection
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _coerce_float(value: object) -> float | None:
+    """Best-effort float from a profile value; None if absent or non-numeric."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 _FAN_SPEEDS_BY_COUNT = {
     3: [FanSpeed.QUIET, FanSpeed.LOW, FanSpeed.POWERFUL],
@@ -33,6 +46,7 @@ class IndoorUnit(Device):
         self._status = DeviceStatus()
         self._profile: dict = {}
         self._profile_fetched = False
+        self._polls_since_profile = 0
         self._has_mhk2: bool = True
 
     @property
@@ -87,8 +101,8 @@ class IndoorUnit(Device):
             dirs.append(VaneDirection.SWING)
         return dirs
 
-    async def update_status(self) -> bool:
-        """Poll the device for current status, profile, and sensors. Returns True on success."""
+    async def _refresh_status(self) -> bool:
+        """Fetch current status, profile, and sensors. Returns True on success."""
         # Indoor unit status (always fetch)
         query = b'{"c":{"indoorUnit":{"status":{}}}}'
         response = await self.request(query)
@@ -101,11 +115,14 @@ class IndoorUnit(Device):
         # Sensors (always fetch)
         sensors = await self._fetch_sensors()
 
-        # Profile, adapter status, adapter info, MHK2 — only on first poll
+        # Profile, adapter status, adapter info, MHK2 — only when (re)fetching
+        # the profile; otherwise cheaper polls carry these forward.
         min_cool_sp = None
         max_cool_sp = None
         min_heat_sp = None
         max_heat_sp = None
+        min_auto_sp = None
+        max_auto_sp = None
         firmware_version = None
         hardware_version = None
         uptime = None
@@ -113,23 +130,40 @@ class IndoorUnit(Device):
         run_state = None
         mhk2_humidity = None
 
-        if not self._profile_fetched:
+        # Re-fetch the profile on the first poll and periodically thereafter so
+        # cached capabilities and setpoint limits self-heal after a firmware or
+        # configuration change.
+        refresh_profile = (
+            not self._profile_fetched
+            or self._polls_since_profile >= PROFILE_REFRESH_POLLS
+        )
+
+        if refresh_profile:
             # Profile
             query = b'{"c":{"indoorUnit":{"profile":{}}}}'
             response = await self.request(query)
             try:
                 self._profile = response["r"]["indoorUnit"]["profile"]
             except (KeyError, TypeError):
-                _LOGGER.warning("Device %s: failed to retrieve profile", self._name)
-                return False
+                if not self._profile_fetched:
+                    _LOGGER.warning("Device %s: failed to retrieve profile", self._name)
+                    return False
+                # A periodic refresh failed transiently: keep the last good
+                # profile (and re-derive its bounds below) rather than failing
+                # an otherwise-healthy poll. Retried on the next interval.
+                _LOGGER.debug("Device %s: profile refresh failed; keeping cached", self._name)
 
-            # Read setpoint limits from profile
+            # Read setpoint limits from profile (last-good if a refresh failed).
+            # Bounds are coerced to float so a stringified limit can't crash the
+            # setpoint range check.
             min_sp = self._profile.get("minimumSetPoints", {})
             max_sp = self._profile.get("maximumSetPoints", {})
-            min_cool_sp = min_sp.get("cool")
-            min_heat_sp = min_sp.get("heat")
-            max_cool_sp = max_sp.get("cool")
-            max_heat_sp = max_sp.get("heat")
+            min_cool_sp = _coerce_float(min_sp.get("cool"))
+            min_heat_sp = _coerce_float(min_sp.get("heat"))
+            min_auto_sp = _coerce_float(min_sp.get("auto"))
+            max_cool_sp = _coerce_float(max_sp.get("cool"))
+            max_heat_sp = _coerce_float(max_sp.get("heat"))
+            max_auto_sp = _coerce_float(max_sp.get("auto"))
 
             # Adapter status
             query = b'{"c":{"adapter":{"status":{}}}}'
@@ -177,7 +211,9 @@ class IndoorUnit(Device):
                     self._has_mhk2 = False
 
             self._profile_fetched = True
+            self._polls_since_profile = 0
         else:
+            self._polls_since_profile += 1
             # Subsequent polls: only fetch adapter status for wifi/run_state/uptime
             query = b'{"c":{"adapter":{"status":{}}}}'
             response = await self.request(query)
@@ -213,6 +249,8 @@ class IndoorUnit(Device):
             max_cool_sp = self._status.max_cool_setpoint
             min_heat_sp = self._status.min_heat_setpoint
             max_heat_sp = self._status.max_heat_setpoint
+            min_auto_sp = self._status.min_auto_setpoint
+            max_auto_sp = self._status.max_auto_setpoint
             firmware_version = self._status.firmware_version
             hardware_version = self._status.hardware_version
 
@@ -253,51 +291,87 @@ class IndoorUnit(Device):
             max_cool_setpoint=max_cool_sp,
             min_heat_setpoint=min_heat_sp,
             max_heat_setpoint=max_heat_sp,
+            min_auto_setpoint=min_auto_sp,
+            max_auto_setpoint=max_auto_sp,
         )
+        return True
+
+    async def _send_command(self, field: str, value: str | float) -> CommandResult:
+        payload = {"c": {"indoorUnit": {"status": {field: value}}}}
+        command = json.dumps(payload, separators=(",", ":")).encode()
+        async with self._burst():
+            response = await self.request(command)
+        if "r" in response:
+            return CommandResult(success=True, value=value)
+        return CommandResult(success=False)
+
+    def _valid_setpoint(
+        self, label: str, temp: float, low: float | None, high: float | None
+    ) -> bool:
+        """Reject non-finite or out-of-range setpoints before sending them.
+
+        Range bounds come from the unit profile (populated after the first
+        poll); when a bound is unknown it is not enforced. A non-finite value
+        would also serialize to invalid JSON, so it is always rejected.
+        """
+        if not math.isfinite(temp):
+            _LOGGER.warning("Device %s: %s setpoint %s is not a finite number", self._name, label, temp)
+            return False
+        if low is not None and temp < low:
+            _LOGGER.warning("Device %s: %s setpoint %s below minimum %s", self._name, label, temp, low)
+            return False
+        if high is not None and temp > high:
+            _LOGGER.warning("Device %s: %s setpoint %s above maximum %s", self._name, label, temp, high)
+            return False
         return True
 
     async def set_mode(self, mode: Mode) -> CommandResult:
         if mode not in self.supported_modes:
             _LOGGER.warning("Device %s: mode %s not supported", self._name, mode.value)
             return CommandResult(success=False)
-        command = f'{{"c":{{"indoorUnit":{{"status":{{"mode":"{mode.value}"}}}}}}}}'.encode()
-        response = await self.request(command)
-        if response and "r" in response:
-            return CommandResult(success=True, value=mode.value)
-        return CommandResult(success=False)
+        return await self._send_command("mode", mode.value)
+
+    def _effective_bounds(
+        self, mode_low: float | None, mode_high: float | None
+    ) -> tuple[float | None, float | None]:
+        """Widen a mode's setpoint range with the auto-changeover range.
+
+        In AUTO mode the unit accepts setpoints across its (often wider) auto
+        range, and the last-polled mode may lag a mode the user just set, so
+        the effective bound is the union of the mode range and the auto range.
+        This validates against the widest range the device could accept,
+        rejecting only values out of range for every mode.
+        """
+        lows = [b for b in (mode_low, self._status.min_auto_setpoint) if b is not None]
+        highs = [b for b in (mode_high, self._status.max_auto_setpoint) if b is not None]
+        return (min(lows) if lows else None, max(highs) if highs else None)
 
     async def set_cool_setpoint(self, temperature: float) -> CommandResult:
         temp = round(float(temperature), 1)
-        command = f'{{"c":{{"indoorUnit":{{"status":{{"spCool":{temp}}}}}}}}}'.encode()
-        response = await self.request(command)
-        if response and "r" in response:
-            return CommandResult(success=True, value=temp)
-        return CommandResult(success=False)
+        low, high = self._effective_bounds(
+            self._status.min_cool_setpoint, self._status.max_cool_setpoint
+        )
+        if not self._valid_setpoint("cool", temp, low, high):
+            return CommandResult(success=False)
+        return await self._send_command("spCool", temp)
 
     async def set_heat_setpoint(self, temperature: float) -> CommandResult:
         temp = round(float(temperature), 1)
-        command = f'{{"c":{{"indoorUnit":{{"status":{{"spHeat":{temp}}}}}}}}}'.encode()
-        response = await self.request(command)
-        if response and "r" in response:
-            return CommandResult(success=True, value=temp)
-        return CommandResult(success=False)
+        low, high = self._effective_bounds(
+            self._status.min_heat_setpoint, self._status.max_heat_setpoint
+        )
+        if not self._valid_setpoint("heat", temp, low, high):
+            return CommandResult(success=False)
+        return await self._send_command("spHeat", temp)
 
     async def set_fan_speed(self, speed: FanSpeed) -> CommandResult:
         if speed not in self.supported_fan_speeds:
             _LOGGER.warning("Device %s: fan speed %s not supported", self._name, speed.value)
             return CommandResult(success=False)
-        command = f'{{"c":{{"indoorUnit":{{"status":{{"fanSpeed":"{speed.value}"}}}}}}}}'.encode()
-        response = await self.request(command)
-        if response and "r" in response:
-            return CommandResult(success=True, value=speed.value)
-        return CommandResult(success=False)
+        return await self._send_command("fanSpeed", speed.value)
 
     async def set_vane_direction(self, direction: VaneDirection) -> CommandResult:
         if direction not in self.supported_vane_directions:
             _LOGGER.warning("Device %s: vane direction %s not supported", self._name, direction.value)
             return CommandResult(success=False)
-        command = f'{{"c":{{"indoorUnit":{{"status":{{"vaneDir":"{direction.value}"}}}}}}}}'.encode()
-        response = await self.request(command)
-        if response and "r" in response:
-            return CommandResult(success=True, value=direction.value)
-        return CommandResult(success=False)
+        return await self._send_command("vaneDir", direction.value)

@@ -87,3 +87,5 @@ class DeviceStatus:
     max_cool_setpoint: float | None = None
     min_heat_setpoint: float | None = None
     max_heat_setpoint: float | None = None
+    min_auto_setpoint: float | None = None
+    max_auto_setpoint: float | None = None
