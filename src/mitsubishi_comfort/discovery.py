@@ -27,6 +27,7 @@ async def probe_candidate_ips(
     candidate_ips: list[str],
     timeout: float = 3.0,
     max_concurrent: int = 64,
+    session: aiohttp.ClientSession | None = None,
 ) -> dict[str, str]:
     """Probe candidate IPs concurrently to match device serials to LAN addresses.
 
@@ -35,6 +36,9 @@ async def probe_candidate_ips(
     IP a device authenticates against wins. This relies on L3 HTTP rather than
     L2 discovery, so it resolves units on other subnets/VLANs as long as they
     are routable from this host.
+
+    An injected ``session`` is shared by every probe and never closed here;
+    without one, each probe creates and closes its own.
 
     Returns dict mapping serial -> IP address.
     """
@@ -50,7 +54,7 @@ async def probe_candidate_ips(
         async with semaphore:
             if serial in result:
                 return
-            if await _probe_ip(ip, dev.password, dev.crypto_serial, timeout):
+            if await _probe_ip(ip, dev.password, dev.crypto_serial, timeout, session):
                 if result.setdefault(serial, ip) == ip:
                     _LOGGER.info("Matched %s -> %s", serial, ip)
 
@@ -66,7 +70,11 @@ async def probe_candidate_ips(
 
 
 async def _probe_ip(
-    ip: str, password_b64: str, crypto_serial_hex: str, timeout: float
+    ip: str,
+    password_b64: str,
+    crypto_serial_hex: str,
+    timeout: float,
+    session: aiohttp.ClientSession | None = None,
 ) -> bool:
     """Try a status query against an IP with given credentials."""
     try:
@@ -84,15 +92,25 @@ async def _probe_ip(
         "Content-Type": "application/json",
     }
 
+    owns_session = session is None
+    if owns_session:
+        session = aiohttp.ClientSession()
     try:
-        client_timeout = aiohttp.ClientTimeout(total=timeout)
-        async with aiohttp.ClientSession(timeout=client_timeout) as session:
-            async with session.put(
-                url, headers=headers, data=_PROBE_QUERY, params={"m": token}
-            ) as resp:
-                if resp.ok:
-                    data = await resp.json(content_type=None)
-                    return isinstance(data, dict) and "r" in data
+        # Per-request timeout so an injected session's own settings cannot
+        # stall the probe sweep.
+        async with session.put(
+            url,
+            headers=headers,
+            data=_PROBE_QUERY,
+            params={"m": token},
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            if resp.ok:
+                data = await resp.json(content_type=None)
+                return isinstance(data, dict) and "r" in data
     except Exception:
         pass
+    finally:
+        if owns_session:
+            await session.close()
     return False
