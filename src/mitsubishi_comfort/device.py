@@ -11,7 +11,11 @@ from typing import Any
 import aiohttp
 
 from .auth import compute_token
-from .const import DEFAULT_CONNECT_TIMEOUT, DEFAULT_RESPONSE_TIMEOUT
+from .const import (
+    CRYPTO_SERIAL_MIN_BYTES,
+    DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_RESPONSE_TIMEOUT,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,6 +59,22 @@ class Device:
             _LOGGER.warning("Device %s: invalid hex crypto serial, disabling requests", name)
             self._crypto_serial = bytearray()
             self._address = None
+        else:
+            # Well-formed hex can still be too short to index. Cloud discovery
+            # yields an empty crypto serial whenever the per-device status
+            # endpoint omits cryptoSerial, and request() computes the token
+            # outside its own error handling — so an unchecked short serial
+            # raises IndexError out of every poll and command.
+            if len(self._crypto_serial) < CRYPTO_SERIAL_MIN_BYTES:
+                _LOGGER.warning(
+                    "Device %s: crypto serial too short (%d bytes, need %d), "
+                    "disabling requests",
+                    name,
+                    len(self._crypto_serial),
+                    CRYPTO_SERIAL_MIN_BYTES,
+                )
+                self._crypto_serial = bytearray()
+                self._address = None
 
     @property
     def name(self) -> str:

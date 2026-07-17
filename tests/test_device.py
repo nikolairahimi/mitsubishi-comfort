@@ -206,6 +206,49 @@ async def test_request_no_address():
     assert result == {}
 
 
+@pytest.mark.parametrize(
+    "crypto_serial_hex",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("00112233445566", id="seven_bytes"),
+        pytest.param("0011223344556677", id="eight_bytes"),
+    ],
+)
+async def test_request_short_crypto_serial_disables_requests(crypto_serial_hex):
+    """A valid-hex but too-short serial must degrade, not raise IndexError.
+
+    compute_token() indexes crypto_serial[8] and runs before request()'s own
+    error handling, so these values used to crash every poll and command.
+    Cloud discovery emits an empty serial when the status endpoint omits it.
+    """
+    device = Device(
+        name="Short Serial",
+        address="192.168.1.50",
+        password_b64="dGVzdA==",
+        crypto_serial_hex=crypto_serial_hex,
+        serial="W00000",
+    )
+    assert device.address is None
+    assert await device.request(b'{}') == {}
+
+
+async def test_request_minimum_crypto_serial_is_accepted():
+    """Exactly nine bytes is the shortest serial compute_token() can index."""
+    device = Device(
+        name="Min Serial",
+        address="192.168.1.50",
+        password_b64="dGVzdA==",
+        crypto_serial_hex="001122334455667788",
+        serial="W00000",
+    )
+    assert device.address == "192.168.1.50"
+
+    with aioresponses() as m:
+        m.put(re.compile(r"http://192\.168\.1\.50/api(\?.*)?"), payload={"r": {}})
+        assert await device.request(b'{}') == {"r": {}}
+    await device.close()
+
+
 async def test_external_session_not_closed(device_credentials, device_serial):
     async with aiohttp.ClientSession() as external:
         device = Device(

@@ -14,6 +14,7 @@ import logging
 import aiohttp
 
 from .auth import compute_token
+from .const import CRYPTO_SERIAL_MIN_BYTES
 from .types import DeviceInfo
 
 _LOGGER = logging.getLogger(__name__)
@@ -71,7 +72,7 @@ async def _probe_ip(
     try:
         password = base64.b64decode(password_b64)
         crypto_serial = bytearray.fromhex(crypto_serial_hex)
-        if len(crypto_serial) < 9:
+        if len(crypto_serial) < CRYPTO_SERIAL_MIN_BYTES:
             return False
     except Exception:
         return False

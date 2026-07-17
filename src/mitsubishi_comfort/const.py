@@ -6,6 +6,11 @@ W_PARAM = bytearray.fromhex(
 )
 S_PARAM = 0
 
+# compute_token() reads crypto_serial[8], so a shorter serial cannot produce a
+# token at all. Credentials below this length must disable requests rather than
+# reach the token computation.
+CRYPTO_SERIAL_MIN_BYTES = 9
+
 # Local unit HTTP API timeouts (seconds)
 DEFAULT_CONNECT_TIMEOUT = 1.2
 DEFAULT_RESPONSE_TIMEOUT = 8.0
