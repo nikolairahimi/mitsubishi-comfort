@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -202,7 +203,13 @@ class Device:
                 async with session.put(
                     url, headers=headers, data=post_data, params={"m": token}
                 ) as resp:
-                    body = await resp.json(content_type=None)
+                    # Decoded leniently rather than via resp.json(): the adapter
+                    # echoes EEPROM strings (model names, manufacture numbers)
+                    # with their trailing 0xff padding intact, and a strict
+                    # utf-8 decode would reject the whole response over padding
+                    # in fields nothing here reads.
+                    raw = await resp.read()
+                    body = json.loads(raw.decode("utf-8", errors="replace"))
                     # Honor the dict return type: a misbehaving adapter can
                     # yield any JSON value (list/scalar/null); callers index
                     # into a mapping, so normalize anything else to {}.

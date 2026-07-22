@@ -194,6 +194,29 @@ async def test_request_normalizes_non_dict_body_to_empty(mock_device, body):
     assert result == {}
 
 
+async def test_request_tolerates_invalid_utf8_in_body(mock_device):
+    """Adapters pad EEPROM strings with 0xff; the rest of the body still parses.
+
+    Model name and serial fields are returned straight from the board, trailing
+    padding included, so a strict utf-8 decode of the whole body would discard
+    an otherwise usable response.
+    """
+    body = (
+        b'{"r":{"adapter":{"status":{'
+        b'"model_name":"SUZ-AK48NL-U1\xff\xff",'
+        b'"manufacture_number":"57U0072070001\xff",'
+        b'"runState":"standby"}}}}'
+    )
+
+    with aioresponses() as m:
+        m.put(API_URL_RE, body=body)
+        result = await mock_device.request(b'{}')
+
+    status = result["r"]["adapter"]["status"]
+    assert status["runState"] == "standby"
+    assert status["model_name"].startswith("SUZ-AK48NL-U1")
+
+
 async def test_request_no_address():
     device = Device(
         name="No Address",
