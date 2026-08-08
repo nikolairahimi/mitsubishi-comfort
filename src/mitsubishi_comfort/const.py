@@ -32,3 +32,9 @@ V3_SOCKET_URL = "https://socket-prod.kumocloud.com"
 V3_APP_VERSION = "3.2.4"
 V3_CLOUD_TIMEOUT_CONNECT = 10
 V3_CLOUD_TIMEOUT_READ = 30
+
+# Legacy V2 Cloud API. The V3 API stopped returning cryptoSerial and the
+# Socket.IO password on newly provisioned accounts; this endpoint still serves
+# both (plus the MAC) and is the fallback used to onboard when V3 falls short.
+V2_LOGIN_URL = "https://geo-c.kumocloud.com/login"
+V2_APP_VERSION = "2.2.0"

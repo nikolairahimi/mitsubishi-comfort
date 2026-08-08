@@ -205,6 +205,193 @@ class TestDiscoverDevices:
         assert devices["SER002"].is_indoor_unit is False
         await cloud.close()
 
+    async def test_discover_falls_back_to_v2_when_v3_incomplete(self, cloud):
+        cloud._access_token = "test_token"
+
+        v2_payload = [
+            {"token": {"access": "v2"}},
+            {},
+            {
+                "children": [
+                    {
+                        "zoneTable": {
+                            "SER001": {
+                                "serial": "SER001",
+                                "label": "Living Room",
+                                "password": "v2_password",
+                                "cryptoSerial": "0102030405060708090a",
+                                "mac": "24:cd:8d:1e:7b:15",
+                                "unitType": "ductless",
+                            }
+                        }
+                    }
+                ]
+            },
+        ]
+
+        with aioresponses() as m:
+            m.get("https://app-prod.kumocloud.com/v3/sites/", payload=[{"id": "site1"}])
+            m.get(
+                "https://app-prod.kumocloud.com/v3/sites/site1/zones",
+                payload=[{
+                    "name": "Living Room",
+                    "adapter": {"deviceSerial": "SER001", "isHeadless": False},
+                }],
+            )
+            # V3 status no longer carries cryptoSerial or mac for new accounts.
+            m.get(
+                "https://app-prod.kumocloud.com/v3/devices/SER001/status",
+                payload={},
+            )
+            m.post("https://geo-c.kumocloud.com/login", payload=v2_payload)
+
+            with patch.object(
+                cloud,
+                "get_passwords_via_websocket",
+                new=AsyncMock(return_value={}),
+            ) as ws_mock:
+                devices = await cloud.discover_devices()
+
+        assert devices["SER001"].password == "v2_password"
+        assert devices["SER001"].crypto_serial == "0102030405060708090a"
+        assert devices["SER001"].mac == "24:cd:8d:1e:7b:15"
+        # V2 supplied the password, so the slow Socket.IO fetch is skipped.
+        ws_mock.assert_not_awaited()
+        await cloud.close()
+
+    async def test_discover_skips_v2_when_already_credentialed(self, cloud):
+        cloud._access_token = "test_token"
+
+        cached = {
+            "SER001": {
+                "password": "cached_pw",
+                "crypto_serial": "0102030405060708090a",
+                "mac": "24:cd:8d:1e:7b:15",
+                "address": "192.168.1.100",
+            }
+        }
+
+        with aioresponses() as m:
+            m.get("https://app-prod.kumocloud.com/v3/sites/", payload=[{"id": "site1"}])
+            m.get(
+                "https://app-prod.kumocloud.com/v3/sites/site1/zones",
+                payload=[{
+                    "name": "Living Room",
+                    "adapter": {"deviceSerial": "SER001", "isHeadless": False},
+                }],
+            )
+
+            with (
+                patch.object(
+                    cloud,
+                    "get_passwords_via_websocket",
+                    new=AsyncMock(return_value={}),
+                ) as ws_mock,
+                patch.object(
+                    cloud, "fetch_v2_credentials", new=AsyncMock()
+                ) as v2_mock,
+            ):
+                devices = await cloud.discover_devices(cached_credentials=cached)
+
+        # Fully cached credentials leave nothing for V2 (or Socket.IO) to supply.
+        assert devices["SER001"].password == "cached_pw"
+        v2_mock.assert_not_awaited()
+        ws_mock.assert_not_awaited()
+        await cloud.close()
+
+
+class TestV2Credentials:
+    async def test_fetch_v2_credentials_parses_nested_children(self, cloud):
+        payload = [
+            {},
+            {},
+            {
+                "zoneTable": {
+                    "SER_TOP": {
+                        "serial": "SER_TOP",
+                        "password": "pw_top",
+                        "cryptoSerial": "aabbccddeeff00112233",
+                        "mac": "aa:bb:cc:dd:ee:ff",
+                        "label": "Hall",
+                        "unitType": "ductless",
+                    }
+                },
+                "children": [
+                    {
+                        "zoneTable": {
+                            "SER_CHILD": {
+                                "serial": "SER_CHILD",
+                                "password": "pw_child",
+                                "cryptoSerial": "00112233445566778899",
+                                "mac": "11:22:33:44:55:66",
+                                "label": "Den",
+                                "unitType": "headless",
+                            }
+                        }
+                    }
+                ],
+            },
+        ]
+
+        with aioresponses() as m:
+            m.post("https://geo-c.kumocloud.com/login", payload=payload)
+            creds = await cloud.fetch_v2_credentials()
+            await cloud.close()
+
+        assert set(creds) == {"SER_TOP", "SER_CHILD"}
+        assert creds["SER_TOP"]["password"] == "pw_top"
+        assert creds["SER_TOP"]["crypto_serial"] == "aabbccddeeff00112233"
+        assert creds["SER_CHILD"]["mac"] == "11:22:33:44:55:66"
+        assert creds["SER_CHILD"]["unit_type"] == "headless"
+
+    async def test_fetch_v2_credentials_http_error_returns_empty(self, cloud):
+        with aioresponses() as m:
+            m.post("https://geo-c.kumocloud.com/login", status=403)
+            creds = await cloud.fetch_v2_credentials()
+            await cloud.close()
+
+        assert creds == {}
+
+    async def test_fetch_v2_credentials_network_error_returns_empty(self, cloud):
+        with aioresponses() as m:
+            m.post(
+                "https://geo-c.kumocloud.com/login",
+                exception=aiohttp.ClientError("boom"),
+            )
+            creds = await cloud.fetch_v2_credentials()
+            await cloud.close()
+
+        assert creds == {}
+
+    async def test_fetch_v2_credentials_non_json_body_returns_empty(self, cloud):
+        # A retired endpoint serving an HTML error page under HTTP 200 must not
+        # crash discovery on the JSON decode.
+        with aioresponses() as m:
+            m.post(
+                "https://geo-c.kumocloud.com/login",
+                status=200,
+                body="<html><body>Not Found</body></html>",
+                content_type="text/html",
+            )
+            creds = await cloud.fetch_v2_credentials()
+            await cloud.close()
+
+        assert creds == {}
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {},
+            [],
+            [{}, {}],
+            [{}, {}, "not a dict"],
+            [{}, {}, {"children": [{"zoneTable": {"x": {"password": "no_serial"}}}]}],
+        ],
+        ids=["dict", "short_list", "no_index_2", "index_2_not_dict", "unit_without_serial"],
+    )
+    def test_parse_v2_credentials_malformed_returns_empty(self, data):
+        assert MitsubishiCloudAccount._parse_v2_credentials(data) == {}
+
 
 class TestUserIdCached:
     def test_user_id_cached(self, cloud):

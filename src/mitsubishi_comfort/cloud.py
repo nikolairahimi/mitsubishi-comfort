@@ -17,6 +17,8 @@ from typing import Any
 import aiohttp
 
 from .const import (
+    V2_APP_VERSION,
+    V2_LOGIN_URL,
     V3_APP_VERSION,
     V3_BASE_URL,
     V3_CLOUD_TIMEOUT_CONNECT,
@@ -32,6 +34,13 @@ _BASE_HEADERS = {
     "Accept": "application/json",
     "Accept-Encoding": "gzip, deflate, br",
     "x-app-version": V3_APP_VERSION,
+    "Content-Type": "application/json",
+}
+
+_V2_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "en-US,en",
     "Content-Type": "application/json",
 }
 
@@ -192,6 +201,77 @@ class MitsubishiCloudAccount:
 
     async def get_device_status(self, serial: str) -> dict | None:
         return await self._get(f"/v3/devices/{serial}/status")
+
+    # ── Legacy V2 Credential Fallback ───────────────────
+
+    async def fetch_v2_credentials(self) -> dict[str, dict[str, str]]:
+        """Fetch per-device local credentials from the legacy V2 cloud login.
+
+        The V3 API no longer returns cryptoSerial or the Socket.IO password for
+        newly provisioned accounts, so a device discovered purely through V3
+        cannot be onboarded. The legacy geo-c.kumocloud.com/login endpoint still
+        returns both — plus the MAC — keyed by serial.
+
+        Returns serial -> {password, crypto_serial, mac, label, unit_type}, and
+        an empty dict on any failure so discovery degrades gracefully rather than
+        aborting.
+        """
+        body = {
+            "username": self._username,
+            "password": self._password,
+            "appVersion": V2_APP_VERSION,
+        }
+        try:
+            session = await self._get_session()
+            async with session.post(
+                V2_LOGIN_URL, headers=_V2_HEADERS, json=body
+            ) as resp:
+                if not resp.ok:
+                    _LOGGER.warning("V2 login failed: HTTP %s", resp.status)
+                    return {}
+                data = await resp.json(content_type=None)
+        except (aiohttp.ClientError, TimeoutError) as ex:
+            _LOGGER.warning("V2 login error: %s", ex)
+            return {}
+        except ValueError as ex:
+            _LOGGER.warning("V2 login returned malformed JSON: %s", ex)
+            return {}
+
+        return self._parse_v2_credentials(data)
+
+    @staticmethod
+    def _parse_v2_credentials(data: Any) -> dict[str, dict[str, str]]:
+        """Extract serial -> credentials from a V2 login response.
+
+        Units live in zoneTable maps nested under data[2] and its (possibly
+        recursive) children. Only entries carrying a serial are returned.
+        """
+        creds: dict[str, dict[str, str]] = {}
+        if not isinstance(data, list) or len(data) < 3 or not isinstance(data[2], dict):
+            return creds
+
+        def harvest(node: dict) -> None:
+            zone_table = node.get("zoneTable")
+            if isinstance(zone_table, dict):
+                for raw in zone_table.values():
+                    if not isinstance(raw, dict):
+                        continue
+                    serial = raw.get("serial")
+                    if not serial:
+                        continue
+                    creds[serial] = {
+                        "password": raw.get("password") or "",
+                        "crypto_serial": raw.get("cryptoSerial") or "",
+                        "mac": raw.get("mac") or "",
+                        "label": raw.get("label") or "",
+                        "unit_type": raw.get("unitType") or "",
+                    }
+            for child in node.get("children") or []:
+                if isinstance(child, dict):
+                    harvest(child)
+
+        harvest(data[2])
+        return creds
 
     # ── Socket.IO Password Retrieval ────────────────────
 
@@ -374,6 +454,10 @@ class MitsubishiCloudAccount:
                 retrieval; a cached crypto_serial and mac skip the per-device status
                 fetch they would otherwise be read from.
 
+        Any device the V3 API leaves without the password, cryptoSerial, and MAC
+        that onboarding needs is completed from the legacy V2 login, falling back
+        to the Socket.IO password retrieval only if V2 also comes up short.
+
         Returns dict mapping serial -> DeviceInfo.
         """
         if not self._access_token:
@@ -423,7 +507,31 @@ class MitsubishiCloudAccount:
                     if mac:
                         dev["mac"] = mac
 
-        # Only fetch passwords via Socket.IO for devices missing them
+        # V3 no longer supplies cryptoSerial or the Socket.IO password on newly
+        # provisioned accounts, leaving devices unonboardable. Fall back to the
+        # legacy V2 login, which still returns both plus the MAC, for any device
+        # still missing a field onboarding needs. One call covers every device.
+        need_v2 = [
+            s
+            for s, d in devices.items()
+            if not (d["password"] and d["crypto_serial"] and d["mac"])
+        ]
+        if need_v2:
+            _LOGGER.info(
+                "Falling back to V2 login for %d/%d device(s) missing credentials",
+                len(need_v2), len(devices),
+            )
+            v2_creds = await self.fetch_v2_credentials()
+            for serial in need_v2:
+                creds = v2_creds.get(serial)
+                if not creds:
+                    continue
+                dev = devices[serial]
+                for key in ("password", "crypto_serial", "mac"):
+                    if not dev[key] and creds.get(key):
+                        dev[key] = creds[key]
+
+        # Only fetch passwords via Socket.IO for devices still missing them
         need_passwords = [s for s, d in devices.items() if not d["password"]]
         if need_passwords:
             _LOGGER.info(

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mitsubishi-comfort"
-version = "0.5.1"
+version = "0.5.2"
 description = "Async Python library for Mitsubishi minisplit control via Kumo Cloud and local API"
 readme = "README.md"
 license = {text = "MIT"}
