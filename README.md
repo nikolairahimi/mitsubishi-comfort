@@ -6,6 +6,7 @@ Async Python library for controlling Mitsubishi minisplit systems via the Kumo C
 
 - **Cloud discovery** -- authenticate with Kumo Cloud to discover devices, retrieve credentials, and fetch device status
 - **Local control** -- communicate directly with minisplit units over your LAN for low-latency operation
+- **Cloud control** -- control indoor units when local credentials or a LAN address are unavailable
 - **Indoor units** -- full control of mode, temperature setpoints, fan speed, and vane direction
 - **Kumo stations** -- read outdoor temperature and signal strength from headless outdoor units
 - **Async native** -- built on `aiohttp` for use in asyncio applications
@@ -56,9 +57,45 @@ asyncio.run(main())
 |--------|-------------|
 | `login()` | Authenticate and obtain JWT tokens |
 | `refresh()` | Refresh an expired access token |
-| `discover_devices()` | Return `dict[serial, DeviceInfo]` with full credentials |
+| `discover_devices(cloud_fallback=True)` | Return `dict[serial, DeviceInfo]`, retaining any available local credentials |
 | `get_sites()` | List installation sites |
 | `get_zones(site_id)` | List zones within a site |
+| `get_device_details(serial)` | Read cloud device state |
+| `get_device_profile(serial)` | Read capabilities and setpoint limits |
+| `send_command(serial, commands)` | Submit absolute settings through the cloud |
+
+### Cloud indoor unit
+
+Mitsubishi no longer supplies the credentials needed for local control on new
+accounts. `CloudIndoorUnit(info, account)` provides the same status, capability,
+and command interface as `IndoorUnit`, using a shared `MitsubishiCloudAccount`.
+It needs an internet connection, but no LAN address, MAC, password, or crypto serial
+for the device. Kumo Station cloud monitoring is not implemented.
+
+```python
+from mitsubishi_comfort import CloudIndoorUnit, MitsubishiCloudAccount, Mode
+
+async def control():
+    account = MitsubishiCloudAccount("user@example.com", "password")
+    try:
+        await account.login()
+        devices = await account.discover_devices(cloud_fallback=True)
+        info = next(info for info in devices.values() if info.is_indoor_unit)
+        unit = CloudIndoorUnit(info, account)
+        if await unit.update_status():
+            await unit.set_mode(Mode.COOL)
+            await unit.set_cool_setpoint(22.0)
+    finally:
+        await account.close()
+```
+
+Temperatures are in Celsius. A successful cloud command means the API accepted
+the request; `unit.status` changes only after a subsequent status poll. Poll at
+most once per minute. Authentication failures raise `AuthenticationError`,
+transport failures raise `DeviceConnectionError`, and rejected commands raise
+`CommandError`. Rate limits apply to the shared account, and timed-out commands
+are not replayed automatically. Closing a cloud unit does not close its shared
+account; the caller closes the account after all devices are finished.
 
 ### Indoor unit
 

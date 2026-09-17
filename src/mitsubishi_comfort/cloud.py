@@ -25,7 +25,7 @@ from .const import (
     V3_CLOUD_TIMEOUT_READ,
     V3_SOCKET_URL,
 )
-from .exceptions import AuthenticationError, DeviceConnectionError
+from .exceptions import AuthenticationError, CommandError, DeviceConnectionError
 from .types import DeviceInfo
 
 _LOGGER = logging.getLogger(__name__)
@@ -68,6 +68,12 @@ class MitsubishiCloudAccount:
         self._session = session
         self._owns_session = session is None
         self._user_id: str | None = None
+        # Create synchronization primitives on first use in the running loop.
+        self._refresh_lock: asyncio.Lock | None = None
+        self._request_limit: asyncio.Semaphore | None = None
+        self._retry_after = 0.0
+        self._zones_lock: asyncio.Lock | None = None
+        self._zones_cache: dict[str, tuple[float, list[dict]]] = {}
 
     @property
     def user_id(self) -> str | None:
@@ -87,6 +93,7 @@ class MitsubishiCloudAccount:
 
     def _timeout(self) -> aiohttp.ClientTimeout:
         return aiohttp.ClientTimeout(
+            total=V3_CLOUD_TIMEOUT_CONNECT + V3_CLOUD_TIMEOUT_READ,
             sock_connect=V3_CLOUD_TIMEOUT_CONNECT,
             sock_read=V3_CLOUD_TIMEOUT_READ,
         )
@@ -111,14 +118,17 @@ class MitsubishiCloudAccount:
         try:
             session = await self._get_session()
             async with session.post(
-                f"{V3_BASE_URL}/v3/login", headers=_BASE_HEADERS, json=body
+                f"{V3_BASE_URL}/v3/login",
+                headers=_BASE_HEADERS,
+                json=body,
+                timeout=self._timeout(),
             ) as resp:
                 if resp.status in (401, 403):
                     raise AuthenticationError(f"V3 login rejected: HTTP {resp.status}")
                 if not resp.ok:
                     raise DeviceConnectionError(f"V3 login failed: HTTP {resp.status}")
                 data = await resp.json()
-        except (aiohttp.ClientError, TimeoutError) as ex:
+        except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError) as ex:
             raise DeviceConnectionError(f"V3 login error: {ex}") from ex
 
         token_data = data.get("token", {})
@@ -144,13 +154,18 @@ class MitsubishiCloudAccount:
                 f"{V3_BASE_URL}/v3/refresh",
                 headers=headers,
                 json={"refresh": self._refresh_token},
+                timeout=self._timeout(),
             ) as resp:
                 if resp.status in (401, 403):
-                    raise AuthenticationError(f"V3 refresh rejected: HTTP {resp.status}")
+                    raise AuthenticationError(
+                        f"V3 refresh rejected: HTTP {resp.status}"
+                    )
                 if not resp.ok:
-                    raise DeviceConnectionError(f"V3 refresh failed: HTTP {resp.status}")
+                    raise DeviceConnectionError(
+                        f"V3 refresh failed: HTTP {resp.status}"
+                    )
                 data = await resp.json()
-        except (aiohttp.ClientError, TimeoutError) as ex:
+        except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError) as ex:
             raise DeviceConnectionError(f"V3 refresh error: {ex}") from ex
 
         self._access_token = data.get("access")
@@ -161,35 +176,98 @@ class MitsubishiCloudAccount:
     # ── REST API ────────────────────────────────────────
 
     async def _get(self, path: str) -> Any:
-        """Authenticated GET with automatic token refresh on 401.
+        """Authenticated GET with automatic token refresh on 401."""
+        return await self._request("GET", path)
 
-        Raises:
-            AuthenticationError: Both original and refreshed requests rejected.
-            DeviceConnectionError: Network or transport failure.
-        """
+    async def _request(self, method: str, path: str, data: dict | None = None) -> Any:
+        """Send a bounded request, retrying only an explicitly rejected token."""
+        if self._request_limit is None:
+            self._request_limit = asyncio.Semaphore(2)
+        if self._refresh_lock is None:
+            self._refresh_lock = asyncio.Lock()
         url = f"{V3_BASE_URL}{path}"
         try:
             session = await self._get_session()
-            async with session.get(url, headers=self._auth_headers()) as resp:
-                if resp.status == 401:
-                    await self.refresh()
-                    async with session.get(url, headers=self._auth_headers()) as retry_resp:
-                        if retry_resp.status in (401, 403):
+            async with self._request_limit:
+                for attempt in range(2):
+                    if time.monotonic() < self._retry_after:
+                        raise DeviceConnectionError(
+                            "Mitsubishi cloud rate limit in effect"
+                        )
+                    token = self._access_token
+                    async with session.request(
+                        method,
+                        url,
+                        headers=self._auth_headers(),
+                        json=data,
+                        timeout=self._timeout(),
+                    ) as resp:
+                        if resp.status == 401 and attempt == 0:
+                            pass
+                        elif resp.status in (401, 403):
                             raise AuthenticationError(
-                                f"V3 GET {path} still unauthorized after refresh"
+                                "Mitsubishi cloud authentication rejected"
                             )
-                        if not retry_resp.ok:
+                        elif resp.status == 429:
+                            try:
+                                delay = float(resp.headers.get("Retry-After", "60"))
+                            except ValueError:
+                                delay = 60
+                            self._retry_after = time.monotonic() + max(
+                                60, min(delay, 3600)
+                            )
                             raise DeviceConnectionError(
-                                f"V3 GET {path} failed: HTTP {retry_resp.status}"
+                                "Mitsubishi cloud rate limit exceeded"
                             )
-                        return await retry_resp.json()
-                if not resp.ok:
-                    raise DeviceConnectionError(
-                        f"V3 GET {path} failed: HTTP {resp.status}"
-                    )
-                return await resp.json()
-        except (aiohttp.ClientError, TimeoutError) as ex:
-            raise DeviceConnectionError(f"V3 GET {path} error: {ex}") from ex
+                        elif not resp.ok:
+                            if method == "POST" and 400 <= resp.status < 500:
+                                raise CommandError(
+                                    f"Cloud command rejected: HTTP {resp.status}"
+                                )
+                            raise DeviceConnectionError(
+                                f"V3 {method} failed: HTTP {resp.status}"
+                            )
+                        elif resp.status == 204:
+                            return None
+                        else:
+                            return await resp.json()
+                    async with self._refresh_lock:
+                        if token == self._access_token:
+                            await self.refresh()
+        except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError) as ex:
+            raise DeviceConnectionError(f"V3 {method} request failed") from ex
+        except ValueError as ex:
+            raise DeviceConnectionError("Cloud returned invalid JSON") from ex
+
+    async def get_device_details(self, serial: str) -> dict:
+        """Read the current cloud state of a device."""
+        data = await self._get(f"/v3/devices/{serial}")
+        if not isinstance(data, dict) or not data:
+            raise DeviceConnectionError("Cloud returned no device state")
+        return data
+
+    async def get_device_profile(self, serial: str) -> dict:
+        """Read device capabilities and Celsius setpoint limits."""
+        data = await self._get(f"/v3/devices/{serial}/profile")
+        if isinstance(data, list) and data:
+            data = data[0]
+        if not isinstance(data, dict) or not data:
+            raise DeviceConnectionError("Cloud returned no device profile")
+        return data
+
+    async def send_command(self, serial: str, commands: dict) -> None:
+        """Submit absolute settings; acceptance does not confirm device state."""
+        result = await self._request(
+            "POST",
+            "/v3/devices/send-command",
+            {"deviceSerial": serial, "commands": commands},
+        )
+        if isinstance(result, dict) and (
+            result.get("success") is False
+            or result.get("error")
+            or result.get("errors")
+        ):
+            raise CommandError("Cloud rejected the command")
 
     async def get_sites(self) -> list[dict]:
         result = await self._get("/v3/sites/")
@@ -198,6 +276,23 @@ class MitsubishiCloudAccount:
     async def get_zones(self, site_id: str) -> list[dict]:
         result = await self._get(f"/v3/sites/{site_id}/zones")
         return result if isinstance(result, list) else []
+
+    async def get_zone_state(self, site_id: str, serial: str) -> dict:
+        """Share a short-lived site snapshot across concurrent device polls."""
+        if self._zones_lock is None:
+            self._zones_lock = asyncio.Lock()
+        async with self._zones_lock:
+            cached = self._zones_cache.get(site_id)
+            if cached is None or time.monotonic() - cached[0] >= 20:
+                zones = await self.get_zones(site_id)
+                self._zones_cache[site_id] = (time.monotonic(), zones)
+            else:
+                zones = cached[1]
+            for zone in zones:
+                adapter = zone.get("adapter", {})
+                if adapter.get("deviceSerial") == serial:
+                    return adapter
+        return {}
 
     async def get_device_status(self, serial: str) -> dict | None:
         return await self._get(f"/v3/devices/{serial}/status")
@@ -230,7 +325,7 @@ class MitsubishiCloudAccount:
                     _LOGGER.warning("V2 login failed: HTTP %s", resp.status)
                     return {}
                 data = await resp.json(content_type=None)
-        except (aiohttp.ClientError, TimeoutError) as ex:
+        except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError) as ex:
             _LOGGER.warning("V2 login error: %s", ex)
             return {}
         except ValueError as ex:
@@ -310,7 +405,10 @@ class MitsubishiCloudAccount:
 
         # Handshake
         async with session.get(
-            f"{V3_SOCKET_URL}/socket.io/", params=base_params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            f"{V3_SOCKET_URL}/socket.io/",
+            params=base_params,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             if not resp.ok:
                 return
@@ -323,15 +421,20 @@ class MitsubishiCloudAccount:
 
         async def _post(data: str) -> None:
             async with session.post(
-                f"{V3_SOCKET_URL}/socket.io/", params=poll_params,
-                headers=post_headers, data=data, timeout=aiohttp.ClientTimeout(total=10)
+                f"{V3_SOCKET_URL}/socket.io/",
+                params=poll_params,
+                headers=post_headers,
+                data=data,
+                timeout=aiohttp.ClientTimeout(total=10),
             ):
                 pass
 
         async def _poll(timeout: float = 10) -> str:
             async with session.get(
-                f"{V3_SOCKET_URL}/socket.io/", params=poll_params,
-                headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
+                f"{V3_SOCKET_URL}/socket.io/",
+                params=poll_params,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 if not resp.ok:
                     return ""
@@ -359,15 +462,19 @@ class MitsubishiCloudAccount:
             self._extract_passwords(text, passwords, serials_needed)
 
         # Device subscribe
-        await _post("\x1e".join(f'{_SIO_EVENT}["subscribe","{s}"]' for s in serials_needed))
+        await _post(
+            "\x1e".join(f'{_SIO_EVENT}["subscribe","{s}"]' for s in serials_needed)
+        )
         text = await _poll()
         self._extract_passwords(text, passwords, serials_needed)
 
         # Force adapter updates
-        await _post("\x1e".join(
-            f'{_SIO_EVENT}["force_adapter_request","{s}","adapterStatus"]'
-            for s in serials_needed
-        ))
+        await _post(
+            "\x1e".join(
+                f'{_SIO_EVENT}["force_adapter_request","{s}","adapterStatus"]'
+                for s in serials_needed
+            )
+        )
 
         # Trigger device_status_v2
         msgs = [f'{_SIO_EVENT}["device_status_v2",""]']
@@ -398,8 +505,11 @@ class MitsubishiCloudAccount:
                 except Exception:
                     pass
 
-        _LOGGER.info("Socket.IO: found passwords for %d/%d devices",
-                      len(passwords), len(serials_needed))
+        _LOGGER.info(
+            "Socket.IO: found passwords for %d/%d devices",
+            len(passwords),
+            len(serials_needed),
+        )
 
     def _get_user_id_from_token(self) -> str | None:
         if self._user_id is not None:
@@ -423,19 +533,24 @@ class MitsubishiCloudAccount:
         return raw.split("\x1e") if "\x1e" in raw else [raw]
 
     @staticmethod
-    def _extract_passwords(raw: str, passwords: dict[str, str], serials_needed: set[str]) -> None:
+    def _extract_passwords(
+        raw: str, passwords: dict[str, str], serials_needed: set[str]
+    ) -> None:
         for msg in MitsubishiCloudAccount._split_messages(raw):
             if ":" in msg and msg.split(":")[0].isdigit():
                 msg = msg.split(":", 1)[1]
             if not msg.startswith(_SIO_EVENT):
                 continue
             try:
-                payload = json.loads(msg[len(_SIO_EVENT):])
+                payload = json.loads(msg[len(_SIO_EVENT) :])
             except (json.JSONDecodeError, IndexError):
                 continue
-            if (isinstance(payload, list) and len(payload) >= 2
-                    and payload[0] == "adapter_update"
-                    and isinstance(payload[1], dict)):
+            if (
+                isinstance(payload, list)
+                and len(payload) >= 2
+                and payload[0] == "adapter_update"
+                and isinstance(payload[1], dict)
+            ):
                 serial = payload[1].get("deviceSerial", "")
                 password = payload[1].get("password", "")
                 if serial in serials_needed and password:
@@ -444,7 +559,10 @@ class MitsubishiCloudAccount:
     # ── High-Level Discovery ───────────────────────────
 
     async def discover_devices(
-        self, cached_credentials: dict[str, dict] | None = None,
+        self,
+        cached_credentials: dict[str, dict] | None = None,
+        *,
+        cloud_fallback: bool = False,
     ) -> dict[str, DeviceInfo]:
         """Discover all devices on this account.
 
@@ -453,6 +571,8 @@ class MitsubishiCloudAccount:
                 mac, address, ...}. A cached password skips the Socket.IO password
                 retrieval; a cached crypto_serial and mac skip the per-device status
                 fetch they would otherwise be read from.
+            cloud_fallback: Skip password retrieval when other missing local
+                credentials already require cloud control.
 
         Any device the V3 API leaves without the password, cryptoSerial, and MAC
         that onboarding needs is completed from the legacy V2 login, falling back
@@ -475,11 +595,16 @@ class MitsubishiCloudAccount:
                 serial = adapter.get("deviceSerial", "")
                 if serial:
                     devices[serial] = {
+                        "site_id": site_id,
                         "label": zone.get("name", ""),
-                        "unit_type": "headless" if adapter.get("isHeadless") else "ductless",
+                        "unit_type": "headless"
+                        if adapter.get("isHeadless")
+                        else "ductless",
                         "mac": cached.get(serial, {}).get("mac", ""),
                         "password": cached.get(serial, {}).get("password", ""),
-                        "crypto_serial": cached.get(serial, {}).get("crypto_serial", ""),
+                        "crypto_serial": cached.get(serial, {}).get(
+                            "crypto_serial", ""
+                        ),
                     }
 
         if not devices:
@@ -490,9 +615,7 @@ class MitsubishiCloudAccount:
         # LAN MAC address; both come from the per-device status endpoint. Fetch it
         # for any device still missing either (cached_credentials may supply them).
         need_status = [
-            (s, d)
-            for s, d in devices.items()
-            if not d["crypto_serial"] or not d["mac"]
+            (s, d) for s, d in devices.items() if not d["crypto_serial"] or not d["mac"]
         ]
         if need_status:
             results = await asyncio.gather(
@@ -519,7 +642,8 @@ class MitsubishiCloudAccount:
         if need_v2:
             _LOGGER.info(
                 "Falling back to V2 login for %d/%d device(s) missing credentials",
-                len(need_v2), len(devices),
+                len(need_v2),
+                len(devices),
             )
             v2_creds = await self.fetch_v2_credentials()
             for serial in need_v2:
@@ -532,18 +656,26 @@ class MitsubishiCloudAccount:
                         dev[key] = creds[key]
 
         # Only fetch passwords via Socket.IO for devices still missing them
-        need_passwords = [s for s, d in devices.items() if not d["password"]]
+        need_passwords = [
+            s
+            for s, d in devices.items()
+            if not d["password"]
+            and (not cloud_fallback or (d["crypto_serial"] and d["mac"]))
+        ]
         if need_passwords:
             _LOGGER.info(
                 "Fetching passwords via Socket.IO for %d/%d devices",
-                len(need_passwords), len(devices),
+                len(need_passwords),
+                len(devices),
             )
-            passwords = await self.get_passwords_via_websocket(need_passwords, timeout_secs=60)
+            passwords = await self.get_passwords_via_websocket(
+                need_passwords, timeout_secs=60
+            )
             for serial, password in passwords.items():
                 if serial in devices:
                     devices[serial]["password"] = password
         else:
-            _LOGGER.info("All %d devices have cached credentials, skipping Socket.IO", len(devices))
+            _LOGGER.debug("No devices need Socket.IO credential retrieval")
 
         return {
             serial: DeviceInfo(
@@ -554,6 +686,7 @@ class MitsubishiCloudAccount:
                 unit_type=dev["unit_type"],
                 password=dev["password"],
                 crypto_serial=dev["crypto_serial"],
+                site_id=dev["site_id"],
             )
             for serial, dev in devices.items()
         }

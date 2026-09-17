@@ -55,6 +55,7 @@ class DeviceInfo:
     unit_type: str
     password: str
     crypto_serial: str
+    site_id: str = ""
 
     @property
     def is_indoor_unit(self) -> bool:

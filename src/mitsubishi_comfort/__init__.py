@@ -1,8 +1,9 @@
 """Async Python library for Mitsubishi minisplit control."""
 
-__version__ = "0.2.0"
+__version__ = "0.6.0"
 
 from .cloud import MitsubishiCloudAccount
+from .cloud_indoor_unit import CloudIndoorUnit
 from .device import Device
 from .discovery import probe_candidate_ips
 from .exceptions import (
