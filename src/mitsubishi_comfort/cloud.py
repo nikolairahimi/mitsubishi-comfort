@@ -558,6 +558,31 @@ class MitsubishiCloudAccount:
 
     # ── High-Level Discovery ───────────────────────────
 
+    async def discover_cloud_devices(self) -> dict[str, DeviceInfo]:
+        """Discover supported cloud indoor units without fetching local credentials."""
+        if not self._access_token:
+            await self.login()
+
+        devices: dict[str, DeviceInfo] = {}
+        for site in await self.get_sites():
+            if not (site_id := site.get("id")):
+                continue
+            for zone in await self.get_zones(site_id):
+                adapter = zone.get("adapter", {})
+                if adapter.get("isHeadless") or not (serial := adapter.get("deviceSerial")):
+                    continue
+                devices[serial] = DeviceInfo(
+                    serial=serial,
+                    label=zone.get("name", ""),
+                    site_id=site_id,
+                    unit_type="ductless",
+                    address="",
+                    mac="",
+                    password="",
+                    crypto_serial="",
+                )
+        return devices
+
     async def discover_devices(
         self,
         cached_credentials: dict[str, dict] | None = None,

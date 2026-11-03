@@ -58,6 +58,7 @@ asyncio.run(main())
 | `login()` | Authenticate and obtain JWT tokens |
 | `refresh()` | Refresh an expired access token |
 | `discover_devices(cloud_fallback=True)` | Return `dict[serial, DeviceInfo]`, retaining any available local credentials |
+| `discover_cloud_devices()` | Return supported indoor units as `dict[serial, DeviceInfo]` without retrieving local credentials |
 | `get_sites()` | List installation sites |
 | `get_zones(site_id)` | List zones within a site |
 | `get_device_details(serial)` | Read cloud device state |
@@ -79,8 +80,8 @@ async def control():
     account = MitsubishiCloudAccount("user@example.com", "password")
     try:
         await account.login()
-        devices = await account.discover_devices(cloud_fallback=True)
-        info = next(info for info in devices.values() if info.is_indoor_unit)
+        devices = await account.discover_cloud_devices()
+        info = next(iter(devices.values()))
         unit = CloudIndoorUnit(info, account)
         if await unit.update_status():
             await unit.set_mode(Mode.COOL)

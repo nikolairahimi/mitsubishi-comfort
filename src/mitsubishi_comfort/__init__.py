@@ -1,6 +1,6 @@
 """Async Python library for Mitsubishi minisplit control."""
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 from .cloud import MitsubishiCloudAccount
 from .cloud_indoor_unit import CloudIndoorUnit
