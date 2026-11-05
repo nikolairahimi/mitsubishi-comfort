@@ -51,6 +51,23 @@ _SIO_CONNECT = "40"
 _SIO_EVENT = "42"
 _SIO_CONNECT_ERROR = "44"
 
+# Longest slice of an error response body quoted in an exception message.
+_ERROR_BODY_LIMIT = 200
+
+
+async def _error_detail(resp: aiohttp.ClientResponse) -> str:
+    """Return ``": <body>"`` for an error message, or ``""`` if there is none.
+
+    The cloud names the reason for a rejection only in the body, for example
+    ``{"error":{"commands":"invalidSpCoolIncrement"}}``. A body that cannot be
+    read must not change which exception the status code raises.
+    """
+    try:
+        body = (await resp.text(errors="replace")).strip()
+    except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError):
+        return ""
+    return f": {body[:_ERROR_BODY_LIMIT]}" if body else ""
+
 
 class MitsubishiCloudAccount:
     """Async client for the Mitsubishi Comfort V3 cloud API."""
@@ -220,12 +237,14 @@ class MitsubishiCloudAccount:
                                 "Mitsubishi cloud rate limit exceeded"
                             )
                         elif not resp.ok:
+                            detail = await _error_detail(resp)
                             if method == "POST" and 400 <= resp.status < 500:
                                 raise CommandError(
                                     f"Cloud command rejected: HTTP {resp.status}"
+                                    f"{detail}"
                                 )
                             raise DeviceConnectionError(
-                                f"V3 {method} failed: HTTP {resp.status}"
+                                f"V3 {method} failed: HTTP {resp.status}{detail}"
                             )
                         elif resp.status == 204:
                             return None

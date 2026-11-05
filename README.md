@@ -90,8 +90,10 @@ async def control():
         await account.close()
 ```
 
-Temperatures are in Celsius. A successful cloud command means the API accepted
-the request; `unit.status` changes only after a subsequent status poll. Poll at
+Temperatures are in Celsius. Setpoints are rounded to the nearest 0.5 °C before
+sending, because the cloud rejects any other value. A successful cloud command
+means the API accepted the request; `unit.status` changes only after a
+subsequent status poll. Poll at
 most once per minute. Authentication failures raise `AuthenticationError`,
 transport failures raise `DeviceConnectionError`, and rejected commands raise
 `CommandError`. Rate limits apply to the shared account, and timed-out commands

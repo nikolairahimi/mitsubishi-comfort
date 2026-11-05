@@ -395,6 +395,18 @@ class TestSetCommands:
         assert result.success is False
         unit.request.assert_not_awaited()
 
+    @pytest.mark.parametrize(
+        ("requested", "sent"), [(22.2, b"22.0"), (22.3, b"22.5"), (23.5, b"23.5")]
+    )
+    async def test_set_setpoint_snaps_to_half_degree(self, requested, sent):
+        """The local API shares the 0.5 °C snapping with the cloud unit."""
+        unit = _make_unit()
+        unit.request = AsyncMock(return_value={"r": {"indoorUnit": {"status": {}}}})
+
+        result = await unit.set_heat_setpoint(requested)
+        assert result.success is True
+        assert b'"spHeat":' + sent in unit.request.call_args[0][0]
+
     async def test_set_command_empty_response_fails_cleanly(self):
         """request() normalizes junk bodies to {}, so a command just fails."""
         unit = _make_unit()
