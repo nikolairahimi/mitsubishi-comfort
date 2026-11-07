@@ -15,4 +15,5 @@ from .exceptions import (
 )
 from .indoor_unit import IndoorUnit
 from .kumo_station import KumoStation
+from .temperature import fahrenheit_to_setpoint, setpoint_to_fahrenheit
 from .types import CommandResult, DeviceInfo, DeviceStatus, FanSpeed, Mode, VaneDirection

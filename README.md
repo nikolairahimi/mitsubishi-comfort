@@ -100,6 +100,36 @@ transport failures raise `DeviceConnectionError`, and rejected commands raise
 are not replayed automatically. Closing a cloud unit does not close its shared
 account; the caller closes the account after all devices are finished.
 
+### Comfort app Fahrenheit setpoints
+
+The Comfort app uses a lookup table rather than ordinary unit conversion:
+71 °F selects 22.0 °C, and 72 °F selects 22.5 °C. To match those selections,
+convert the original Fahrenheit request with `fahrenheit_to_setpoint` and
+convert the returned Celsius setpoint with `setpoint_to_fahrenheit`:
+
+```python
+from mitsubishi_comfort import fahrenheit_to_setpoint, setpoint_to_fahrenheit
+
+result = await unit.set_cool_setpoint(fahrenheit_to_setpoint(72))
+if result.success:
+    print(setpoint_to_fahrenheit(result.value))  # 72
+```
+
+Both local and cloud setters still accept Celsius and return Celsius in
+`CommandResult.value`; existing Celsius callers are unchanged. The helpers
+use the [documented app table](https://github.com/dlarrick/hass-kumo/pull/199)
+for 61–80 °F, with arithmetic fallback outside that range. Fractional
+Fahrenheit requests round to the nearest whole degree (half degrees up).
+Non-finite inputs raise `ValueError`. These are setpoint helpers; measured
+room temperatures should continue to use ordinary unit conversion.
+
+Home Assistant consumers must use Fahrenheit as the climate entity's native
+unit when the user selects Fahrenheit, then call these helpers at the library
+boundary. Otherwise Home Assistant converts 72 °F to 22.2 °C before the
+library receives it, losing the original app selection. Report setpoints and
+temperature limits in the same native unit, and leave Celsius users on the
+existing Celsius path.
+
 ### Indoor unit
 
 `IndoorUnit` controls a minisplit indoor unit over the local HTTP API.
