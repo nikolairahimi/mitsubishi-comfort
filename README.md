@@ -90,8 +90,9 @@ async def control():
         await account.close()
 ```
 
-Temperatures are in Celsius. Setpoints are rounded to the nearest 0.5 °C before
-sending, because the cloud rejects any other value. A successful cloud command
+Temperatures are in Celsius. Cloud setpoints are rounded to the nearest 0.5 °C
+before sending, because the cloud rejects any other value. Local `IndoorUnit`
+setters retain their existing 0.1 °C rounding. A successful cloud command
 means the API accepted the request; `unit.status` changes only after a
 subsequent status poll. Poll at
 most once per minute. Authentication failures raise `AuthenticationError`,
@@ -116,12 +117,19 @@ if result.success:
 ```
 
 Both local and cloud setters still accept Celsius and return Celsius in
-`CommandResult.value`; existing Celsius callers are unchanged. The helpers
+`CommandResult.value`. The helpers
 use the [documented app table](https://github.com/dlarrick/hass-kumo/pull/199)
 for 61–80 °F, with arithmetic fallback outside that range. Fractional
 Fahrenheit requests round to the nearest whole degree (half degrees up).
 Non-finite inputs raise `ValueError`. These are setpoint helpers; measured
 room temperatures should continue to use ordinary unit conversion.
+
+Outside 61–80 °F, the request fallback converts `(F - 32) / 1.8` to the nearest
+0.5 °C; the display fallback rounds `C * 1.8 + 32` to a whole degree. These are
+arithmetic defaults, not verified current Comfort app mappings. For example,
+84 °F falls back to 29.0 °C, whereas the
+[older Kumo app table](https://github.com/dlarrick/pykumo/issues/15#issuecomment-987140863)
+maps it to 28.5 °C. App parity outside the documented range remains unverified.
 
 Home Assistant consumers must use Fahrenheit as the climate entity's native
 unit when the user selects Fahrenheit, then call these helpers at the library

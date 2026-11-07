@@ -131,29 +131,9 @@ class IndoorUnitControls:
             return False
         return True
 
-    def _snap_setpoint(self, label: str, temperature: float) -> float:
-        """Round a requested setpoint to the nearest 0.5 °C.
-
-        Mitsubishi units step setpoints in 0.5 °C, and since late October 2026
-        the V3 cloud rejects any other value with HTTP 400
-        (``invalidSpCoolIncrement``). Most whole °F values convert to off-grid
-        Celsius (72 °F is 22.2 °C), so snap rather than send a value the cloud
-        will refuse. Exact quarter-degree ties round to even (22.25 -> 22.0).
-        Non-finite values pass through for ``_valid_setpoint`` to reject.
-        """
-        temp = float(temperature)
-        if not math.isfinite(temp):
-            return temp
-        snapped = round(temp * 2) / 2
-        if snapped != temp:
-            _LOGGER.debug(
-                "Device %s: %s setpoint %s rounded to %s (0.5 °C steps)",
-                self._name,
-                label,
-                temp,
-                snapped,
-            )
-        return snapped
+    def _normalize_setpoint(self, label: str, temperature: float) -> float:
+        """Preserve the local protocol's one-decimal Celsius precision."""
+        return round(float(temperature), 1)
 
     async def set_mode(self, mode: Mode) -> CommandResult:
         if mode not in self.supported_modes:
@@ -179,7 +159,7 @@ class IndoorUnitControls:
         return (min(lows) if lows else None, max(highs) if highs else None)
 
     async def set_cool_setpoint(self, temperature: float) -> CommandResult:
-        temp = self._snap_setpoint("cool", temperature)
+        temp = self._normalize_setpoint("cool", temperature)
         low, high = self._effective_bounds(
             self._status.min_cool_setpoint, self._status.max_cool_setpoint
         )
@@ -188,7 +168,7 @@ class IndoorUnitControls:
         return await self._send_command("spCool", temp)
 
     async def set_heat_setpoint(self, temperature: float) -> CommandResult:
-        temp = self._snap_setpoint("heat", temperature)
+        temp = self._normalize_setpoint("heat", temperature)
         low, high = self._effective_bounds(
             self._status.min_heat_setpoint, self._status.max_heat_setpoint
         )

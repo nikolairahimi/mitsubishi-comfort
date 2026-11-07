@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -12,7 +12,6 @@ from mitsubishi_comfort.types import (
     Mode,
     VaneDirection,
 )
-
 
 VALID_PASSWORD_B64 = "dGVzdHBhc3N3b3Jk"
 VALID_CRYPTO_HEX = "0102030405060708090a"
@@ -396,16 +395,37 @@ class TestSetCommands:
         unit.request.assert_not_awaited()
 
     @pytest.mark.parametrize(
-        ("requested", "sent"), [(22.2, b"22.0"), (22.3, b"22.5"), (23.5, b"23.5")]
+        ("method", "field"),
+        [("set_cool_setpoint", b"spCool"), ("set_heat_setpoint", b"spHeat")],
     )
-    async def test_set_setpoint_snaps_to_half_degree(self, requested, sent):
-        """The local API shares the 0.5 °C snapping with the cloud unit."""
+    @pytest.mark.parametrize(
+        ("requested", "sent"),
+        [(22.2, b"22.2"), (22.3, b"22.3"), (22.24, b"22.2"), (23.5, b"23.5")],
+    )
+    async def test_set_setpoint_preserves_local_precision(
+        self, method: str, field: bytes, requested: float, sent: bytes
+    ) -> None:
         unit = _make_unit()
         unit.request = AsyncMock(return_value={"r": {"indoorUnit": {"status": {}}}})
 
-        result = await unit.set_heat_setpoint(requested)
+        result = await getattr(unit, method)(requested)
         assert result.success is True
-        assert b'"spHeat":' + sent in unit.request.call_args[0][0]
+        assert result.value == float(sent)
+        assert b'"' + field + b'":' + sent in unit.request.call_args[0][0]
+
+    @pytest.mark.parametrize("method", ["set_cool_setpoint", "set_heat_setpoint"])
+    async def test_local_setpoint_above_limit_is_not_snapped_down(
+        self, method: str
+    ) -> None:
+        unit = _make_unit()
+        unit._status.max_cool_setpoint = 30.0
+        unit._status.max_heat_setpoint = 30.0
+        unit.request = AsyncMock()
+
+        result = await getattr(unit, method)(30.2)
+
+        assert result.success is False
+        unit.request.assert_not_awaited()
 
     async def test_set_command_empty_response_fails_cleanly(self):
         """request() normalizes junk bodies to {}, so a command just fails."""

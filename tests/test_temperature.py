@@ -43,10 +43,18 @@ def test_intermediate_setpoint_labels(celsius: float, fahrenheit: int) -> None:
 
 @pytest.mark.parametrize(
     ("fahrenheit", "celsius"),
-    [(50, 10.0), (60, 15.5), (81, 27.0), (88, 31.0)],
+    [(50, 10.0), (60, 15.5), (81, 27.0), (84, 29.0), (88, 31.0)],
 )
-def test_outside_table(fahrenheit: int, celsius: float) -> None:
+def test_arithmetic_fallback(fahrenheit: int, celsius: float) -> None:
+    """Fallback values are arithmetic defaults, not confirmed app selections."""
     assert fahrenheit_to_setpoint(fahrenheit) == celsius
+    assert setpoint_to_fahrenheit(celsius) == fahrenheit
+
+
+@pytest.mark.parametrize(
+    ("celsius", "fahrenheit"), [(15.0, 59), (28.5, 83), (30.0, 86)],
+)
+def test_arithmetic_display_fallback(celsius: float, fahrenheit: int) -> None:
     assert setpoint_to_fahrenheit(celsius) == fahrenheit
 
 

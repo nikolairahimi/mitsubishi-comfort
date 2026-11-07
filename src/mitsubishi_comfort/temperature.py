@@ -40,6 +40,7 @@ def fahrenheit_to_setpoint(temperature: float) -> float:
     The app selects whole Fahrenheit degrees. Round fractional requests to
     the nearest whole degree, with half degrees rounded up. Use the app's
     table for 61–80 °F; elsewhere, use arithmetic rounded to 0.5 °C.
+    The fallback is not verified against the current app.
     Non-finite temperatures raise ValueError.
     """
     if not math.isfinite(temperature):
@@ -54,8 +55,9 @@ def fahrenheit_to_setpoint(temperature: float) -> float:
 def setpoint_to_fahrenheit(temperature: float) -> int:
     """Convert a Celsius setpoint to the app's whole-degree Fahrenheit label.
 
-    Use arithmetic rounding outside the known table. This helper describes
-    thermostat setpoints, not a general-purpose sensor unit conversion.
+    Use arithmetic rounding outside the known table, without verified app
+    parity there. This helper describes thermostat setpoints, not a
+    general-purpose sensor unit conversion.
     Non-finite temperatures raise ValueError.
     """
     if not math.isfinite(temperature):
