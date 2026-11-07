@@ -73,6 +73,46 @@ async def test_command_errors(
     await account.close()
 
 
+@pytest.mark.parametrize(
+    ("status", "body", "error", "message"),
+    [
+        pytest.param(
+            400,
+            '{"error":{"commands":"invalidSpCoolIncrement"}}',
+            CommandError,
+            "Cloud command rejected: HTTP 400: "
+            '{"error":{"commands":"invalidSpCoolIncrement"}}',
+            id="reason-in-body",
+        ),
+        pytest.param(
+            400, "", CommandError, "Cloud command rejected: HTTP 400", id="no-body"
+        ),
+        pytest.param(
+            503,
+            "x" * 500,
+            DeviceConnectionError,
+            "V3 POST failed: HTTP 503: " + "x" * 200,
+            id="truncated",
+        ),
+    ],
+)
+async def test_error_response_body_in_message(
+    account: MitsubishiCloudAccount,
+    status: int,
+    body: str,
+    error: type[Exception],
+    message: str,
+) -> None:
+    with aioresponses() as response:
+        response.post(
+            f"{V3_BASE_URL}/v3/devices/send-command", status=status, body=body
+        )
+        with pytest.raises(error) as caught:
+            await account.send_command("SER001", {"spCool": 22.2})
+    assert str(caught.value) == message
+    await account.close()
+
+
 @pytest.mark.parametrize("timeout", [TimeoutError, asyncio.TimeoutError])
 @pytest.mark.parametrize("operation", ["login", "refresh", "details", "command", "v2"])
 async def test_timeouts_are_wrapped_without_retry(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -149,14 +150,50 @@ async def test_commands(
     assert device.status is status
 
 
-@pytest.mark.parametrize("temperature", [float("nan"), float("inf"), 40, 10])
+@pytest.mark.parametrize(
+    ("method", "field"),
+    [("set_cool_setpoint", "spCool"), ("set_heat_setpoint", "spHeat")],
+)
+@pytest.mark.parametrize(
+    ("requested", "sent"),
+    [
+        pytest.param(22.2, 22.0, id="72F-rounds-down"),
+        pytest.param(22.3, 22.5, id="rounds-up"),
+        pytest.param(23.5, 23.5, id="on-grid-unchanged"),
+        pytest.param(21, 21.0, id="int-unchanged"),
+        pytest.param(30.2, 30.0, id="snapped-before-bounds-check"),
+    ],
+)
+async def test_setpoint_snaps_to_half_degree(
+    device: CloudIndoorUnit,
+    account: AsyncMock,
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    field: str,
+    requested: float,
+    sent: float,
+) -> None:
+    """The cloud rejects setpoints off the 0.5 °C grid with HTTP 400."""
+    await device.update_status()
+    caplog.set_level(logging.DEBUG, logger="mitsubishi_comfort")
+    result = await getattr(device, method)(requested)
+    assert result.success
+    account.send_command.assert_awaited_once_with("SER001", {field: sent})
+    assert ("rounded to" in caplog.text) == (requested != sent)
+
+
+@pytest.mark.parametrize("method", ["set_cool_setpoint", "set_heat_setpoint"])
+@pytest.mark.parametrize(
+    "temperature", [float("nan"), float("inf"), float("-inf"), 40, 10, 30.3]
+)
 async def test_reject_invalid_temperature(
     device: CloudIndoorUnit,
     account: AsyncMock,
+    method: str,
     temperature: float,
 ) -> None:
     await device.update_status()
-    assert not (await device.set_cool_setpoint(temperature)).success
+    assert not (await getattr(device, method)(temperature)).success
     account.send_command.assert_not_awaited()
 
 

@@ -131,6 +131,10 @@ class IndoorUnitControls:
             return False
         return True
 
+    def _normalize_setpoint(self, label: str, temperature: float) -> float:
+        """Preserve the local protocol's one-decimal Celsius precision."""
+        return round(float(temperature), 1)
+
     async def set_mode(self, mode: Mode) -> CommandResult:
         if mode not in self.supported_modes:
             _LOGGER.warning("Device %s: mode %s not supported", self._name, mode.value)
@@ -155,7 +159,7 @@ class IndoorUnitControls:
         return (min(lows) if lows else None, max(highs) if highs else None)
 
     async def set_cool_setpoint(self, temperature: float) -> CommandResult:
-        temp = round(float(temperature), 1)
+        temp = self._normalize_setpoint("cool", temperature)
         low, high = self._effective_bounds(
             self._status.min_cool_setpoint, self._status.max_cool_setpoint
         )
@@ -164,7 +168,7 @@ class IndoorUnitControls:
         return await self._send_command("spCool", temp)
 
     async def set_heat_setpoint(self, temperature: float) -> CommandResult:
-        temp = round(float(temperature), 1)
+        temp = self._normalize_setpoint("heat", temperature)
         low, high = self._effective_bounds(
             self._status.min_heat_setpoint, self._status.max_heat_setpoint
         )

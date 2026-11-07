@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 
 from .cloud import MitsubishiCloudAccount
 from .const import PROFILE_REFRESH_POLLS
 from .indoor_unit import _coerce_float
 from .indoor_unit_controls import IndoorUnitControls
 from .types import CommandResult, DeviceInfo, DeviceStatus, FanSpeed, Mode
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class CloudIndoorUnit(IndoorUnitControls):
@@ -58,6 +62,27 @@ class CloudIndoorUnit(IndoorUnitControls):
         if not self._profile.get("numberOfFanSpeeds"):
             return [FanSpeed.AUTO] if self._profile.get("hasFanSpeedAuto") else []
         return super().supported_fan_speeds
+
+    def _normalize_setpoint(self, label: str, temperature: float) -> float:
+        """Round a requested setpoint to the nearest 0.5 °C.
+
+        The V3 cloud rejects other increments. Exact quarter-degree ties
+        round to even (22.25 -> 22.0).
+        Non-finite values pass through for ``_valid_setpoint`` to reject.
+        """
+        temp = float(temperature)
+        if not math.isfinite(temp):
+            return temp
+        snapped = round(temp * 2) / 2
+        if snapped != temp:
+            _LOGGER.debug(
+                "Device %s: %s setpoint %s rounded to %s (0.5 °C steps)",
+                self._name,
+                label,
+                temp,
+                snapped,
+            )
+        return snapped
 
     async def close(self) -> None:
         """The shared account's lifetime is managed by the caller."""

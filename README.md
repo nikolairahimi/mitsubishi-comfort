@@ -90,13 +90,53 @@ async def control():
         await account.close()
 ```
 
-Temperatures are in Celsius. A successful cloud command means the API accepted
-the request; `unit.status` changes only after a subsequent status poll. Poll at
+Temperatures are in Celsius. Cloud setpoints are rounded to the nearest 0.5 °C
+before sending, because the cloud rejects any other value. Local `IndoorUnit`
+setters retain their existing 0.1 °C rounding. A successful cloud command
+means the API accepted the request; `unit.status` changes only after a
+subsequent status poll. Poll at
 most once per minute. Authentication failures raise `AuthenticationError`,
 transport failures raise `DeviceConnectionError`, and rejected commands raise
 `CommandError`. Rate limits apply to the shared account, and timed-out commands
 are not replayed automatically. Closing a cloud unit does not close its shared
 account; the caller closes the account after all devices are finished.
+
+### Comfort app Fahrenheit setpoints
+
+The Comfort app uses a lookup table rather than ordinary unit conversion:
+71 °F selects 22.0 °C, and 72 °F selects 22.5 °C. To match those selections,
+convert the original Fahrenheit request with `fahrenheit_to_setpoint` and
+convert the returned Celsius setpoint with `setpoint_to_fahrenheit`:
+
+```python
+from mitsubishi_comfort import fahrenheit_to_setpoint, setpoint_to_fahrenheit
+
+result = await unit.set_cool_setpoint(fahrenheit_to_setpoint(72))
+if result.success:
+    print(setpoint_to_fahrenheit(result.value))  # 72
+```
+
+Both local and cloud setters still accept Celsius and return Celsius in
+`CommandResult.value`. The helpers
+use the [documented app table](https://github.com/dlarrick/hass-kumo/pull/199)
+for 61–80 °F, with arithmetic fallback outside that range. Fractional
+Fahrenheit requests round to the nearest whole degree (half degrees up).
+Non-finite inputs raise `ValueError`. These are setpoint helpers; measured
+room temperatures should continue to use ordinary unit conversion.
+
+Outside 61–80 °F, the request fallback converts `(F - 32) / 1.8` to the nearest
+0.5 °C; the display fallback rounds `C * 1.8 + 32` to a whole degree. These are
+arithmetic defaults, not verified current Comfort app mappings. For example,
+84 °F falls back to 29.0 °C, whereas the
+[older Kumo app table](https://github.com/dlarrick/pykumo/issues/15#issuecomment-987140863)
+maps it to 28.5 °C. App parity outside the documented range remains unverified.
+
+Home Assistant consumers must use Fahrenheit as the climate entity's native
+unit when the user selects Fahrenheit, then call these helpers at the library
+boundary. Otherwise Home Assistant converts 72 °F to 22.2 °C before the
+library receives it, losing the original app selection. Report setpoints and
+temperature limits in the same native unit, and leave Celsius users on the
+existing Celsius path.
 
 ### Indoor unit
 
